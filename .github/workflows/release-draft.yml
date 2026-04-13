@@ -1,0 +1,149 @@
+name: Build Draft Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create or update
+        required: true
+        type: string
+      release_name:
+        description: Draft release title
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate release inputs
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Validate tag format
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]]; then
+            echo "Invalid tag: $tag"
+            echo "Expected format: v<major>.<minor>.<patch> or a semver prerelease/build variant."
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.platform.name }} artifact
+    needs: validate
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+            binary_name: mesh-p2p
+            archive_suffix: linux-x86_64
+            archive_extension: tar.gz
+            artifact_name: mesh-p2p-linux-x86_64
+          - name: windows-x86_64
+            runner: windows-2022
+            binary_name: mesh-p2p.exe
+            archive_suffix: windows-x86_64
+            archive_extension: zip
+            artifact_name: mesh-p2p-windows-x86_64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+          shared-key: release-draft-${{ matrix.platform.name }}
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri executable
+        run: pnpm tauri build
+
+      - name: Package Linux executable
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p release
+          cp src-tauri/target/release/${{ matrix.platform.binary_name }} release/
+          tar -C release -czf mesh-p2p-${{ github.event.inputs.tag }}-${{ matrix.platform.archive_suffix }}.${{ matrix.platform.archive_extension }} ${{ matrix.platform.binary_name }}
+
+      - name: Package Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Copy-Item "src-tauri/target/release/${{ matrix.platform.binary_name }}" "release/${{ matrix.platform.binary_name }}"
+          Compress-Archive -Path "release/${{ matrix.platform.binary_name }}" -DestinationPath "mesh-p2p-${{ github.event.inputs.tag }}-${{ matrix.platform.archive_suffix }}.${{ matrix.platform.archive_extension }}" -Force
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform.artifact_name }}
+          path: mesh-p2p-${{ github.event.inputs.tag }}-${{ matrix.platform.archive_suffix }}.${{ matrix.platform.archive_extension }}
+          if-no-files-found: error
+
+  release:
+    name: Publish draft release
+    runs-on: ubuntu-22.04
+    needs:
+      - validate
+      - build
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-artifacts
+
+      - name: Publish draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.release_name || github.event.inputs.tag }}
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist-artifacts/**/*.tar.gz
+            dist-artifacts/**/*.zip
