@@ -2,7 +2,7 @@ use std::{
     collections::{HashSet, VecDeque},
     net::{SocketAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -26,6 +26,10 @@ const RATE_LIMIT_WINDOW_MS: u64 = 1000;
 const RATE_LIMIT_MAX: usize = 40;
 const CLIENT_ACTIVITY_WINDOW_SECS: u64 = 300;
 const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB chunks for streaming hash
+const METADATA_VERSION: u16 = 1;
+const APP_VERSION_PLACEHOLDER: &str = "__APP_VERSION__";
+
+static APP_VERSION: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -70,7 +74,19 @@ pub struct ShareStatus {
     fallback_http_enabled: bool,
     session: Option<ShareSession>,
     metrics: ShareMetrics,
+    insights: ShareInsights,
     processing_progress: Option<ProcessingProgress>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareInsights {
+    share_state: String,
+    reachability: String,
+    active_downloads: usize,
+    recent_error: Option<String>,
+    recent_activity_label: String,
+    next_action_hint: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -107,6 +123,7 @@ struct ShareRuntime {
     metadata_revision: u64,
     last_activity_unix_ms: u128,
     client_activity: VecDeque<ClientActivity>,
+    last_error: Option<String>,
     processing_progress: Option<ProcessingProgress>,
     processing_cancel_requested: bool,
 }
@@ -135,6 +152,21 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MetadataResponse {
+    metadata_version: u16,
+    session_id: String,
+    files: Vec<SharedFile>,
+    file_count: usize,
+    total_size: u64,
+    revision: u64,
+    last_updated_unix_ms: u128,
+    tracker_urls: Vec<String>,
+    started_at_unix_ms: u128,
+    fallback_http_enabled: bool,
+}
+
 impl ShareState {
     pub fn new() -> Self {
         let tracker_urls = load_trackers_from_env();
@@ -150,6 +182,7 @@ impl ShareState {
                 metadata_revision: 0,
                 last_activity_unix_ms: unix_time_ms(),
                 client_activity: VecDeque::new(),
+                last_error: None,
                 processing_progress: None,
                 processing_cancel_requested: false,
             })),
@@ -275,6 +308,7 @@ pub async fn add_share_files(
             Ok(files) => files,
             Err(err) => {
                 if let Ok(mut guard) = state.inner.lock() {
+                    guard.last_error = Some(err.clone());
                     guard.processing_progress = None;
                 }
                 return Err(err);
@@ -287,6 +321,7 @@ pub async fn add_share_files(
         .map_err(|_| "State lock poisoned".to_string())?;
     guard.metadata_revision += 1;
     guard.last_activity_unix_ms = unix_time_ms();
+    guard.last_error = None;
     guard.processing_progress = None; // Clear progress after completion
     guard.processing_cancel_requested = false;
     let revision = guard.metadata_revision;
@@ -371,6 +406,7 @@ pub async fn start_share(
         Ok(files) => files,
         Err(err) => {
             if let Ok(mut guard) = state.inner.lock() {
+                guard.last_error = Some(err.clone());
                 guard.processing_progress = None;
             }
             return Err(err);
@@ -398,6 +434,7 @@ pub async fn start_share(
         guard.http_uploaded_bytes = 0;
         guard.metadata_revision = 1;
         guard.last_activity_unix_ms = started_at;
+        guard.last_error = None;
         guard.client_activity.clear();
         guard.processing_progress = None; // Clear progress after completion
         guard.processing_cancel_requested = false;
@@ -440,6 +477,7 @@ pub fn get_share_status(state: State<'_, ShareState>) -> Result<ShareStatus, Str
         fallback_http_enabled: guard.fallback_http_enabled,
         session: guard.session.clone(),
         metrics: build_metrics(&guard),
+        insights: build_insights(&guard),
         processing_progress: guard.processing_progress.clone(),
     })
 }
@@ -537,59 +575,343 @@ async fn download_page_handler() -> impl IntoResponse {
     Html(
         r#"<!doctype html>
 <html lang="zh-Hant">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Mesh P2P Download</title>
-    <style>
-            body { font-family: sans-serif; padding: 2rem; line-height: 1.5; }
-      .card { max-width: 680px; margin: 0 auto; border: 1px solid #ddd; border-radius: 10px; padding: 1.2rem; }
-      code { background: #f2f2f2; padding: 0.1rem 0.25rem; border-radius: 4px; }
-      .muted { color: #666; }
-      .row { margin-bottom: 0.75rem; }
-            .grid { display: grid; gap: 0.75rem; }
-      button { padding: 0.5rem 1rem; }
-    </style>
-  </head>
-  <body>
-    <div class="card">
-      <h1>Mesh P2P 分享下載頁</h1>
-            <div id="status" class="row muted">載入中...</div>
-            <div id="meta" class="grid"></div>
-            <div id="files" class="grid"></div>
-    </div>
-    <script>
-            let lastRevision = -1;
-      async function loadMetadata() {
-        const status = document.getElementById('status');
-        const meta = document.getElementById('meta');
-                const files = document.getElementById('files');
-        try {
-          const resp = await fetch('/api/metadata');
-          if (!resp.ok) {
-            status.textContent = '目前沒有可用分享。';
-            meta.textContent = '';
-                        files.textContent = '';
-            return;
-          }
-          const data = await resp.json();
-                    if (data.revision === lastRevision) {
-                        status.textContent = `分享中，已同步 ${data.fileCount} 個檔案`;
-                        return;
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Mesh P2P Download</title>
+        <link rel="icon" type="image/png" href="/mesh.png" />
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/css/materialdesignicons.min.css" />
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vuetify@3.10.8/dist/vuetify.min.css" />
+        <style>
+            html, body, #app { height: 100%; margin: 0; }
+            body {
+                background:
+                    radial-gradient(circle at 10% 14%, rgba(16, 185, 129, 0.2), transparent 30%),
+                    radial-gradient(circle at 92% 10%, rgba(249, 115, 22, 0.2), transparent 28%),
+                    linear-gradient(135deg, #f5f7f2 0%, #eef8f6 50%, #f9f4ea 100%);
+            }
+            .tiny { font-size: 12px; color: #475569; }
+        </style>
+    </head>
+    <body>
+        <div id="app"></div>
+
+        <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/vuetify@3.10.8/dist/vuetify.min.js"></script>
+        <script>
+            const { createApp, ref, computed, onMounted, onUnmounted } = Vue;
+            const { createVuetify } = Vuetify;
+
+            const vuetify = createVuetify({
+                theme: {
+                    defaultTheme: 'mesh',
+                    themes: {
+                        mesh: {
+                            dark: false,
+                            colors: {
+                                primary: '#0f766e',
+                                secondary: '#14532d',
+                                accent: '#c2410c',
+                                warning: '#a16207',
+                                error: '#b91c1c'
+                            }
+                        }
                     }
-                    lastRevision = data.revision;
-          status.textContent = '分享中';
-                    meta.innerHTML = `<div class='row'>分享檔案數：<strong>${data.fileCount}</strong></div><div class='row'>總大小：${data.totalSize} bytes</div><div class='row'>版本：<code>${data.revision}</code></div>`;
-                    files.innerHTML = data.files.map((file) => `<div class='row'><strong>${file.fileName}</strong> (${file.fileSize} bytes) <a href='/api/file/${file.fileId}' download>下載</a></div>`).join('');
-        } catch (_) {
-          status.textContent = '無法連線到分享服務。';
-        }
-      }
-      loadMetadata();
-            setInterval(loadMetadata, 5000);
-    </script>
-  </body>
-</html>"#,
+                }
+            });
+
+            function formatBytes(bytes) {
+                if (!bytes) return '0 B';
+                const k = 1024;
+                const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+                const idx = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
+                const val = bytes / Math.pow(k, idx);
+                return `${val.toFixed(idx === 0 ? 0 : 2)} ${units[idx]}`;
+            }
+
+            function nowMs() {
+                return Date.now();
+            }
+
+            createApp({
+                setup() {
+                    const statusText = ref('載入中...');
+                    const warningText = ref('');
+                    const metadata = ref(null);
+                    const metadataError = ref('');
+                    const lastRevision = ref(-1);
+                    const timerId = ref(null);
+                    const downloads = ref({});
+
+                    const files = computed(() => metadata.value?.files ?? []);
+
+                    function ensureDownloadState(fileId) {
+                        if (!downloads.value[fileId]) {
+                            downloads.value[fileId] = {
+                                phase: 'idle',
+                                progressPercent: 0,
+                                bytesReceived: 0,
+                                totalBytes: 0,
+                                speedBps: 0,
+                                etaSeconds: 0,
+                                sourceMix: 'P2P + HTTP metadata 初始化',
+                                errorCode: null,
+                                startedAt: 0,
+                                lastTickAt: 0,
+                                smoothedSpeedBps: 0,
+                            };
+                        }
+                        return downloads.value[fileId];
+                    }
+
+                    async function loadMetadata() {
+                        metadataError.value = '';
+                        warningText.value = '';
+                        try {
+                            const resp = await fetch('/api/metadata', { cache: 'no-store' });
+                            if (!resp.ok) {
+                                statusText.value = '目前沒有可用分享。';
+                                metadata.value = null;
+                                return;
+                            }
+
+                            const data = await resp.json();
+                            if (typeof data.metadataVersion !== 'number') {
+                                metadataError.value = 'metadata 版本資訊缺失';
+                                statusText.value = 'metadata 格式不支援';
+                                return;
+                            }
+
+                            metadata.value = data;
+                            statusText.value = `分享中，已同步 ${data.fileCount} 個檔案`;
+
+                            if (lastRevision.value !== data.revision) {
+                                lastRevision.value = data.revision;
+                            }
+
+                            if (data.fallbackHttpEnabled) {
+                                warningText.value = '目前啟用 HTTP fallback 模式';
+                            }
+                        } catch (error) {
+                            metadataError.value = String(error);
+                            statusText.value = '無法連線到分享服務。';
+                        }
+                    }
+
+                    function saveBlob(fileName, blob) {
+                        const url = URL.createObjectURL(blob);
+                        const link = document.createElement('a');
+                        link.href = url;
+                        link.download = fileName;
+                        document.body.appendChild(link);
+                        link.click();
+                        link.remove();
+                        URL.revokeObjectURL(url);
+                    }
+
+                    async function downloadFile(file) {
+                        const state = ensureDownloadState(file.fileId);
+                        if (state.phase === 'downloading') {
+                            return;
+                        }
+
+                        state.phase = 'downloading';
+                        state.progressPercent = 0;
+                        state.bytesReceived = 0;
+                        state.totalBytes = file.fileSize || 0;
+                        state.speedBps = 0;
+                        state.etaSeconds = 0;
+                        state.errorCode = null;
+                        state.startedAt = nowMs();
+                        state.lastTickAt = state.startedAt;
+                        state.smoothedSpeedBps = 0;
+
+                        try {
+                            const resp = await fetch(`/api/file/${file.fileId}`);
+                            if (!resp.ok || !resp.body) {
+                                throw new Error(`下載失敗：HTTP ${resp.status}`);
+                            }
+
+                            const contentLength = Number(resp.headers.get('content-length') || file.fileSize || 0);
+                            state.totalBytes = contentLength;
+
+                            const reader = resp.body.getReader();
+                            const chunks = [];
+
+                            while (true) {
+                                const { done, value } = await reader.read();
+                                if (done) break;
+                                chunks.push(value);
+                                state.bytesReceived += value.length;
+
+                                const now = nowMs();
+                                const elapsed = Math.max((now - state.lastTickAt) / 1000, 0.001);
+                                const instSpeed = value.length / elapsed;
+                                state.smoothedSpeedBps = state.smoothedSpeedBps
+                                    ? state.smoothedSpeedBps * 0.7 + instSpeed * 0.3
+                                    : instSpeed;
+                                state.speedBps = Math.round(state.smoothedSpeedBps);
+
+                                if (state.totalBytes > 0) {
+                                    state.progressPercent = Math.min(
+                                        100,
+                                        Math.round((state.bytesReceived / state.totalBytes) * 100),
+                                    );
+                                    const remain = Math.max(0, state.totalBytes - state.bytesReceived);
+                                    state.etaSeconds = state.speedBps > 0 ? Math.ceil(remain / state.speedBps) : 0;
+                                }
+                                state.lastTickAt = now;
+                            }
+
+                            saveBlob(file.fileName, new Blob(chunks, { type: 'application/octet-stream' }));
+                            state.phase = 'downloaded';
+                            state.progressPercent = 100;
+                            state.etaSeconds = 0;
+                        } catch (error) {
+                            state.phase = 'error';
+                            state.errorCode = String(error);
+                        }
+                    }
+
+                    function phaseColor(phase) {
+                        if (phase === 'downloaded') return 'secondary';
+                        if (phase === 'downloading') return 'info';
+                        if (phase === 'error') return 'error';
+                        return 'grey';
+                    }
+
+                    function phaseLabel(phase) {
+                        if (phase === 'downloaded') return '已下載';
+                        if (phase === 'downloading') return '下載中';
+                        if (phase === 'error') return '失敗';
+                        return '待下載';
+                    }
+
+                    onMounted(() => {
+                        loadMetadata();
+                        timerId.value = setInterval(loadMetadata, 5000);
+                    });
+
+                    onUnmounted(() => {
+                        if (timerId.value) {
+                            clearInterval(timerId.value);
+                        }
+                    });
+
+                    return {
+                        statusText,
+                        warningText,
+                        metadata,
+                        metadataError,
+                        files,
+                        downloads,
+                        loadMetadata,
+                        downloadFile,
+                        phaseColor,
+                        phaseLabel,
+                        formatBytes,
+                    };
+                },
+                template: `
+                    <v-app>
+                        <v-main>
+                            <v-container class="py-8" style="max-width: 980px">
+                                <v-card rounded="xl">
+                                    <v-card-title class="d-flex align-center justify-space-between ga-3">
+                                        <span class="text-h5 font-weight-bold">Mesh P2P 分享下載頁</span>
+                                        <v-btn
+                                            icon="mdi-github"
+                                            variant="text"
+                                            color="primary"
+                                            href="https://github.com/loren2018tw/mesh-p2p"
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            aria-label="GitHub Repository"
+                                        />
+                                    </v-card-title>
+                                    <v-card-subtitle>版本： v__APP_VERSION__ By Loren(loren.tw@gmail.com)</v-card-subtitle>
+                                    <v-card-text>
+                                        <v-alert type="info" variant="tonal" class="mb-3">{{ statusText }}</v-alert>
+                                        <v-alert v-if="warningText" type="warning" variant="tonal" class="mb-3">{{ warningText }}</v-alert>
+                                        <v-alert v-if="metadataError" type="error" variant="tonal" class="mb-3">
+                                            讀取 metadata 失敗：{{ metadataError }}
+                                            <template #append>
+                                                <v-btn size="small" color="error" variant="text" @click="loadMetadata">重試</v-btn>
+                                            </template>
+                                        </v-alert>
+
+                                        <v-card v-if="metadata" variant="outlined" class="mb-4">
+                                            <v-card-text class="d-flex flex-wrap ga-4">
+                                                <div>檔案數：<strong>{{ metadata.fileCount }}</strong></div>
+                                                <div>總大小：<strong>{{ formatBytes(metadata.totalSize) }}</strong></div>
+                                            </v-card-text>
+                                        </v-card>
+
+                                        <v-list v-if="files.length" lines="three" class="rounded-lg border">
+                                            <v-list-item
+                                                v-for="file in files"
+                                                :key="file.fileId"
+                                                :title="file.fileName"
+                                                :subtitle="formatBytes(file.fileSize)"
+                                            >
+                                                <template #append>
+                                                    <div style="min-width: 340px" class="d-flex align-center ga-2">
+                                                        <v-chip
+                                                            size="small"
+                                                            :color="phaseColor(downloads[file.fileId]?.phase || 'idle')"
+                                                            variant="flat"
+                                                        >
+                                                            {{ phaseLabel(downloads[file.fileId]?.phase || 'idle') }}
+                                                        </v-chip>
+
+                                                        <v-btn
+                                                            size="small"
+                                                            color="primary"
+                                                            :disabled="downloads[file.fileId]?.phase === 'downloading'"
+                                                            @click="downloadFile(file)"
+                                                        >
+                                                            下載
+                                                        </v-btn>
+                                                    </div>
+                                                </template>
+
+                                                <template #subtitle>
+                                                    <div>
+                                                        <div class="mb-1">{{ formatBytes(file.fileSize) }}</div>
+                                                        <v-progress-linear
+                                                            v-if="downloads[file.fileId]?.phase === 'downloading'"
+                                                            :model-value="downloads[file.fileId]?.progressPercent || 0"
+                                                            color="info"
+                                                            rounded
+                                                            height="10"
+                                                        />
+                                                        <div v-if="downloads[file.fileId]?.phase === 'downloading'" class="tiny mt-1">
+                                                            {{ downloads[file.fileId]?.progressPercent || 0 }}% ・
+                                                            {{ formatBytes(downloads[file.fileId]?.bytesReceived || 0) }} /
+                                                            {{ formatBytes(downloads[file.fileId]?.totalBytes || file.fileSize) }} ・
+                                                            {{ formatBytes(downloads[file.fileId]?.speedBps || 0) }}/s ・
+                                                            ETA {{ downloads[file.fileId]?.etaSeconds || 0 }}s
+                                                        </div>
+                                                        <div v-if="downloads[file.fileId]?.phase === 'error'" class="tiny" style="color:#b91c1c">
+                                                            {{ downloads[file.fileId]?.errorCode }}
+                                                        </div>
+                                                    </div>
+                                                </template>
+                                            </v-list-item>
+                                        </v-list>
+
+                                        <v-alert v-else type="warning" variant="tonal">目前沒有可下載檔案。</v-alert>
+                                    </v-card-text>
+                                </v-card>
+                            </v-container>
+                        </v-main>
+                    </v-app>
+                `
+            }).use(vuetify).mount('#app');
+        </script>
+    </body>
+</html>"#
+            .replace(APP_VERSION_PLACEHOLDER, current_app_version()),
     )
 }
 
@@ -623,7 +945,14 @@ async fn metadata_handler(
     record_client_activity(&mut guard, addr);
 
     match &guard.session {
-        Some(session) => (StatusCode::OK, Json(session.clone())).into_response(),
+        Some(session) => (
+            StatusCode::OK,
+            Json(build_metadata_response(
+                session,
+                guard.fallback_http_enabled,
+            )),
+        )
+            .into_response(),
         None => (
             StatusCode::GONE,
             Json(ErrorResponse {
@@ -829,6 +1158,24 @@ fn refresh_session_summary(session: &mut ShareSession, revision: u64, last_updat
     session.last_updated_unix_ms = last_updated_unix_ms;
 }
 
+fn build_metadata_response(
+    session: &ShareSession,
+    fallback_http_enabled: bool,
+) -> MetadataResponse {
+    MetadataResponse {
+        metadata_version: METADATA_VERSION,
+        session_id: session.session_id.clone(),
+        files: session.files.clone(),
+        file_count: session.file_count,
+        total_size: session.total_size,
+        revision: session.revision,
+        last_updated_unix_ms: session.last_updated_unix_ms,
+        tracker_urls: session.tracker_urls.clone(),
+        started_at_unix_ms: session.started_at_unix_ms,
+        fallback_http_enabled,
+    }
+}
+
 fn record_client_activity(runtime: &mut ShareRuntime, addr: SocketAddr) {
     let now = Instant::now();
     runtime.client_activity.push_back(ClientActivity {
@@ -865,6 +1212,59 @@ fn build_metrics(runtime: &ShareRuntime) -> ShareMetrics {
         metadata_revision: runtime.metadata_revision,
         last_activity_unix_ms: runtime.last_activity_unix_ms,
     }
+}
+
+fn build_insights(runtime: &ShareRuntime) -> ShareInsights {
+    let is_sharing = runtime.session.is_some();
+    let active_downloads = build_metrics(runtime).active_client_count;
+    let reachability = if is_sharing {
+        "LAN 可連線".to_string()
+    } else {
+        "尚未啟動".to_string()
+    };
+    let share_state = if runtime.processing_progress.is_some() {
+        "正在處理檔案".to_string()
+    } else if is_sharing {
+        "分享中".to_string()
+    } else {
+        "未啟動".to_string()
+    };
+
+    let next_action_hint = if runtime.processing_progress.is_some() {
+        "等待種子資料處理完成，系統會自動更新狀態".to_string()
+    } else if is_sharing {
+        "可複製分享 URL 給下載者，或追加新檔案".to_string()
+    } else {
+        "先加入檔案後按「啟動分享」".to_string()
+    };
+
+    ShareInsights {
+        share_state,
+        reachability,
+        active_downloads,
+        recent_error: runtime.last_error.clone(),
+        recent_activity_label: format_recent_activity(runtime.last_activity_unix_ms),
+        next_action_hint,
+    }
+}
+
+fn format_recent_activity(unix_ms: u128) -> String {
+    if unix_ms == 0 {
+        return "暫無活動".to_string();
+    }
+
+    let now = unix_time_ms();
+    let delta_ms = now.saturating_sub(unix_ms);
+    if delta_ms < 1_000 {
+        return "剛剛".to_string();
+    }
+    if delta_ms < 60_000 {
+        return format!("{} 秒前", delta_ms / 1_000);
+    }
+    if delta_ms < 3_600_000 {
+        return format!("{} 分鐘前", delta_ms / 60_000);
+    }
+    format!("{} 小時前", delta_ms / 3_600_000)
 }
 
 #[derive(Debug)]
@@ -985,6 +1385,22 @@ fn load_fallback_flag() -> bool {
             lower == "1" || lower == "true" || lower == "yes"
         })
         .unwrap_or(false)
+}
+
+fn current_app_version() -> &'static str {
+    APP_VERSION
+        .get_or_init(|| {
+            serde_json::from_str::<serde_json::Value>(include_str!("../tauri.conf.json"))
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("version")
+                        .and_then(|version| version.as_str())
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+        })
+        .as_str()
 }
 
 fn detect_host_ip() -> String {

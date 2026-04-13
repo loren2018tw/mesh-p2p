@@ -1,17 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-
-type ShareSession = {
-  sessionId: string;
-  files: SharedFile[];
-  fileCount: number;
-  totalSize: number;
-  revision: number;
-  lastUpdatedUnixMs: number;
-  trackerUrls: string[];
-  startedAtUnixMs: number;
-};
+import QRCode from "qrcode";
+import UiMessageAlert from "./components/UiMessageAlert.vue";
+import UiProgressBar from "./components/UiProgressBar.vue";
+import UiStatusChip from "./components/UiStatusChip.vue";
 
 type SharedFile = {
   fileId: string;
@@ -24,13 +17,31 @@ type SharedFile = {
   magnetUri: string;
 };
 
-type ShareStatus = {
-  isSharing: boolean;
-  serverUrl: string;
-  fallbackHttpEnabled: boolean;
-  session: ShareSession | null;
-  metrics: ShareMetrics;
-  processingProgress: ProcessingProgress | null;
+type ShareSession = {
+  sessionId: string;
+  files: SharedFile[];
+  fileCount: number;
+  totalSize: number;
+  revision: number;
+  lastUpdatedUnixMs: number;
+  trackerUrls: string[];
+  startedAtUnixMs: number;
+};
+
+type ShareMetrics = {
+  activeClientCount: number;
+  httpUploadedBytes: number;
+  metadataRevision: number;
+  lastActivityUnixMs: number;
+};
+
+type ShareInsights = {
+  shareState: string;
+  reachability: string;
+  activeDownloads: number;
+  recentError: string | null;
+  recentActivityLabel: string;
+  nextActionHint: string;
 };
 
 type ProcessingProgress = {
@@ -43,22 +54,32 @@ type ProcessingProgress = {
   percentage: number;
 };
 
-type ShareMetrics = {
-  activeClientCount: number;
-  httpUploadedBytes: number;
-  metadataRevision: number;
-  lastActivityUnixMs: number;
+type ShareStatus = {
+  isSharing: boolean;
+  serverUrl: string;
+  fallbackHttpEnabled: boolean;
+  session: ShareSession | null;
+  metrics: ShareMetrics;
+  insights: ShareInsights;
+  processingProgress: ProcessingProgress | null;
 };
 
 const selectedFilePaths = ref<string[]>([]);
 const manualFilePath = ref("");
 const shareStatus = ref<ShareStatus | null>(null);
 const message = ref("尚未開始分享");
+const messageKind = ref<"success" | "warning" | "error" | "info">("info");
 const isPickingFiles = ref(false);
+const appVersion = __APP_VERSION__;
+const qrDialogOpen = ref(false);
+const shareQrDataUrl = ref("");
+const isGeneratingShareQr = ref(false);
+
+let refreshTimer: number | null = null;
 
 const isSharing = computed(() => !!shareStatus.value?.isSharing);
-
 const activeFiles = computed(() => shareStatus.value?.session?.files ?? []);
+const shareUrl = computed(() => shareStatus.value?.serverUrl ?? "");
 
 const metrics = computed(
   () =>
@@ -70,16 +91,47 @@ const metrics = computed(
     },
 );
 
+const insights = computed(
+  () =>
+    shareStatus.value?.insights ?? {
+      shareState: "未啟動",
+      reachability: "尚未啟動",
+      activeDownloads: 0,
+      recentError: null,
+      recentActivityLabel: "暫無活動",
+      nextActionHint: "先選擇檔案並啟動分享",
+    },
+);
+
 const processingProgress = computed(
   () => shareStatus.value?.processingProgress ?? null,
 );
 
 const isProcessing = computed(() => !!processingProgress.value?.isProcessing);
 
+const currentStatusKind = computed(() => {
+  if (insights.value.recentError) {
+    return "error" as const;
+  }
+  if (isSharing.value) {
+    return "success" as const;
+  }
+  return "neutral" as const;
+});
+
+watch(
+  shareUrl,
+  (url) => {
+    void syncShareQr(url);
+  },
+  { immediate: true },
+);
+
 async function refreshStatus() {
   try {
     shareStatus.value = await invoke<ShareStatus>("get_share_status");
   } catch (error) {
+    messageKind.value = "error";
     message.value = `取得狀態失敗：${String(error)}`;
   }
 }
@@ -97,6 +149,7 @@ async function pickFile() {
       await mergeFilesIntoShare(chosen);
     }
   } catch (error) {
+    messageKind.value = "error";
     message.value = `檔案選取失敗：${String(error)}`;
   } finally {
     isPickingFiles.value = false;
@@ -118,18 +171,14 @@ async function mergeFilesIntoShare(paths: string[]) {
 
   if (isSharing.value) {
     try {
-      const session = await invoke<ShareSession>("add_share_files", {
+      await invoke<ShareSession>("add_share_files", {
         filePaths: uniquePaths,
       });
-      if (shareStatus.value) {
-        shareStatus.value = {
-          ...shareStatus.value,
-          session,
-        };
-      }
       await refreshStatus();
+      messageKind.value = "success";
       message.value = `已加入 ${uniquePaths.length} 個新檔案到分享中`;
     } catch (error) {
+      messageKind.value = "error";
       message.value = `加入分享檔案失敗：${String(error)}`;
     }
     return;
@@ -138,6 +187,7 @@ async function mergeFilesIntoShare(paths: string[]) {
   selectedFilePaths.value = Array.from(
     new Set([...selectedFilePaths.value, ...uniquePaths]),
   );
+  messageKind.value = "info";
   message.value = `已加入 ${uniquePaths.length} 個檔案`;
 }
 
@@ -149,6 +199,7 @@ function removeFile(path: string) {
 
 async function startShare() {
   if (!selectedFilePaths.value.length) {
+    messageKind.value = "warning";
     message.value = "請先加入至少一個要分享的檔案";
     return;
   }
@@ -160,11 +211,13 @@ async function startShare() {
         filePaths: selectedFilePaths.value,
       },
     );
+    messageKind.value = "success";
     message.value = `分享已啟動：${result.serverUrl}`;
     selectedFilePaths.value = [];
     manualFilePath.value = "";
     await refreshStatus();
   } catch (error) {
+    messageKind.value = "error";
     message.value = `啟動分享失敗：${String(error)}`;
   }
 }
@@ -172,296 +225,564 @@ async function startShare() {
 async function stopShare() {
   try {
     await invoke("stop_share");
+    messageKind.value = "warning";
     message.value = "分享已停止";
     await refreshStatus();
   } catch (error) {
+    messageKind.value = "error";
     message.value = `停止分享失敗：${String(error)}`;
   }
 }
 
-onMounted(() => {
-  refreshStatus();
-  window.setInterval(refreshStatus, 5000);
-});
+async function syncShareQr(url: string) {
+  if (!url) {
+    shareQrDataUrl.value = "";
+    qrDialogOpen.value = false;
+    return;
+  }
+
+  isGeneratingShareQr.value = true;
+
+  try {
+    shareQrDataUrl.value = await QRCode.toDataURL(url, {
+      errorCorrectionLevel: "M",
+      margin: 1,
+      width: 320,
+      color: {
+        dark: "#0f172a",
+        light: "#ffffffff",
+      },
+    });
+  } finally {
+    isGeneratingShareQr.value = false;
+  }
+}
+
+async function copyText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+
+  const copied = document.execCommand("copy");
+  textarea.remove();
+
+  if (!copied) {
+    throw new Error("無法複製分享 URL");
+  }
+}
+
+async function openShareQrDialog() {
+  if (!shareUrl.value) {
+    return;
+  }
+
+  try {
+    if (!shareQrDataUrl.value) {
+      await syncShareQr(shareUrl.value);
+    }
+
+    await copyText(shareUrl.value);
+    messageKind.value = "success";
+    message.value = "分享 URL 已複製，請讓對方掃描 QR Code 或直接貼上連結";
+  } catch (error) {
+    messageKind.value = "warning";
+    message.value = `已開啟 QR Code，但複製失敗：${String(error)}`;
+  }
+
+  qrDialogOpen.value = true;
+}
+
+async function copyShareUrl() {
+  if (!shareUrl.value) {
+    return;
+  }
+
+  try {
+    await copyText(shareUrl.value);
+    messageKind.value = "success";
+    message.value = "分享 URL 已複製";
+  } catch (error) {
+    messageKind.value = "error";
+    message.value = `複製分享 URL 失敗：${String(error)}`;
+  }
+}
 
 function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
+  if (!bytes) return "0 B";
   const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i];
+  const sizes = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(k)),
+    sizes.length - 1,
+  );
+  return `${(bytes / Math.pow(k, i)).toFixed(i === 0 ? 0 : 2)} ${sizes[i]}`;
 }
+
+function formatTime(unixMs: number): string {
+  if (!unixMs) return "尚無";
+  return new Date(unixMs).toLocaleString("zh-TW", { hour12: false });
+}
+
+onMounted(() => {
+  refreshStatus();
+  refreshTimer = window.setInterval(refreshStatus, 5000);
+});
+
+onUnmounted(() => {
+  if (refreshTimer) {
+    window.clearInterval(refreshTimer);
+  }
+});
 </script>
 
 <template>
-  <main class="page">
-    <section class="panel">
-      <h1>Mesh P2P File Share</h1>
-      <p class="sub">內建 Web Server + P2P-ready 下載入口</p>
+  <v-app>
+    <v-main class="main-bg">
+      <v-container class="py-6" fluid>
+        <v-row>
+          <v-col cols="12" lg="8">
+            <v-card rounded="xl" class="mb-4">
+              <v-card-title
+                class="d-flex align-center justify-space-between ga-3"
+              >
+                <span class="text-h5 font-weight-bold"
+                  >Mesh P2P File Share</span
+                >
+                <v-btn
+                  icon="mdi-github"
+                  variant="text"
+                  color="primary"
+                  href="https://github.com/loren2018tw/mesh-p2p"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="GitHub Repository"
+                />
+              </v-card-title>
+              <v-card-subtitle
+                >版本： v{{ appVersion }} By
+                Loren(loren.tw@gmail.com)</v-card-subtitle
+              >
+              <v-card-text>
+                <UiMessageAlert :text="message" :kind="messageKind" />
 
-      <div class="field-row">
-        <button :disabled="isPickingFiles" @click="pickFile">
-          {{ isPickingFiles ? "選擇中..." : "選擇檔案" }}
-        </button>
-        <input
-          v-model="manualFilePath"
-          placeholder="手動輸入檔案路徑後按 Enter"
-          @keydown.enter.prevent="addManualPath"
-        />
-      </div>
+                <div class="d-flex align-center ga-2 flex-wrap mb-3">
+                  <UiStatusChip
+                    :label="insights.shareState"
+                    :kind="currentStatusKind"
+                  />
+                  <UiStatusChip
+                    :label="`可達性：${insights.reachability}`"
+                    kind="info"
+                  />
+                  <UiStatusChip
+                    :label="`活躍下載：${insights.activeDownloads}`"
+                    kind="warning"
+                  />
+                </div>
 
-      <div v-if="selectedFilePaths.length && !isSharing" class="meta">
-        <p><strong>待分享檔案：</strong>{{ selectedFilePaths.length }} 個</p>
-        <ul class="file-list">
-          <li v-for="filePath in selectedFilePaths" :key="filePath">
-            <span>{{ filePath }}</span>
-            <button class="ghost small" @click="removeFile(filePath)">
-              移除
-            </button>
-          </li>
-        </ul>
-      </div>
+                <v-row>
+                  <v-col cols="12" md="4">
+                    <v-btn
+                      color="primary"
+                      block
+                      prepend-icon="mdi-file-plus"
+                      :loading="isPickingFiles"
+                      @click="pickFile"
+                    >
+                      選擇檔案
+                    </v-btn>
+                  </v-col>
+                  <v-col cols="12" md="8">
+                    <v-text-field
+                      v-model="manualFilePath"
+                      label="手動輸入檔案路徑，按 Enter 加入"
+                      variant="outlined"
+                      density="comfortable"
+                      hide-details
+                      @keydown.enter.prevent="addManualPath"
+                    />
+                  </v-col>
+                </v-row>
 
-      <div class="field-row">
-        <button @click="startShare">啟動分享</button>
-        <button class="ghost" :disabled="!isSharing" @click="stopShare">
-          停止分享
-        </button>
-      </div>
+                <v-card
+                  v-if="selectedFilePaths.length && !isSharing"
+                  variant="tonal"
+                  class="mt-4"
+                >
+                  <v-card-title class="text-subtitle-1"
+                    >待分享檔案（{{ selectedFilePaths.length }}）</v-card-title
+                  >
+                  <v-list density="comfortable">
+                    <v-list-item
+                      v-for="filePath in selectedFilePaths"
+                      :key="filePath"
+                      :title="filePath"
+                    >
+                      <template #append>
+                        <v-btn
+                          size="small"
+                          variant="text"
+                          color="error"
+                          prepend-icon="mdi-close"
+                          @click="removeFile(filePath)"
+                        >
+                          移除
+                        </v-btn>
+                      </template>
+                    </v-list-item>
+                  </v-list>
+                </v-card>
 
-      <div class="status">
-        <p><strong>狀態：</strong>{{ message }}</p>
-        <p v-if="shareStatus?.serverUrl">
-          <strong>分享 URL（主機 IP）：</strong>{{ shareStatus.serverUrl }}
-        </p>
-        <p v-if="shareStatus?.fallbackHttpEnabled" class="warn">
-          目前啟用 HTTP fallback 模式
-        </p>
-      </div>
+                <div class="d-flex ga-2 mt-4 flex-wrap">
+                  <v-btn
+                    color="secondary"
+                    prepend-icon="mdi-play"
+                    :disabled="isSharing"
+                    @click="startShare"
+                  >
+                    啟動分享
+                  </v-btn>
+                  <v-btn
+                    color="warning"
+                    prepend-icon="mdi-stop"
+                    :disabled="!isSharing"
+                    @click="stopShare"
+                  >
+                    暫停分享
+                  </v-btn>
+                </div>
 
-      <div v-if="isProcessing && processingProgress" class="processing">
-        <p><strong>正在處理檔案...</strong></p>
-        <p class="progress-info">
-          檔案 {{ processingProgress.currentFileIndex }} /
-          {{ processingProgress.totalFiles }} ({{
-            formatBytes(processingProgress.bytesProcessed)
-          }}
-          / {{ formatBytes(processingProgress.totalBytes) }})
-        </p>
-        <div class="progress-bar-container">
-          <div
-            class="progress-bar"
-            :style="{ width: processingProgress.percentage + '%' }"
-          >
-            <span class="progress-text"
-              >{{ processingProgress.percentage }}%</span
-            >
-          </div>
-        </div>
-      </div>
+                <v-card
+                  v-if="shareStatus?.serverUrl"
+                  class="mt-4"
+                  variant="outlined"
+                >
+                  <v-card-text
+                    class="d-flex align-center justify-space-between ga-4 flex-wrap"
+                  >
+                    <div class="share-url-block">
+                      <div class="text-body-2 mb-1">分享 URL（主機 IP）</div>
+                      <div class="text-subtitle-2 text-primary share-url-text">
+                        {{ shareStatus.serverUrl }}
+                      </div>
+                      <div class="d-flex ga-2 mt-3 flex-wrap">
+                        <v-btn
+                          size="small"
+                          color="primary"
+                          variant="tonal"
+                          prepend-icon="mdi-content-copy"
+                          @click="copyShareUrl"
+                        >
+                          複製連結
+                        </v-btn>
+                        <v-btn
+                          size="small"
+                          color="secondary"
+                          variant="text"
+                          prepend-icon="mdi-qrcode"
+                          @click="openShareQrDialog"
+                        >
+                          顯示 QR Code
+                        </v-btn>
+                      </div>
+                      <div
+                        v-if="shareStatus?.fallbackHttpEnabled"
+                        class="text-warning mt-2"
+                      >
+                        目前啟用 HTTP fallback 模式
+                      </div>
+                    </div>
 
-      <div v-if="shareStatus?.session" class="meta">
-        <p><strong>檔案數：</strong>{{ shareStatus.session.fileCount }}</p>
-        <p>
-          <strong>總大小：</strong>{{ shareStatus.session.totalSize }} bytes
-        </p>
-        <p><strong>清單版本：</strong>{{ shareStatus.session.revision }}</p>
-        <ul class="file-list compact">
-          <li v-for="file in activeFiles" :key="file.fileId">
-            <span>{{ file.fileName }}</span>
-            <span>{{ file.fileSize }} bytes</span>
-          </li>
-        </ul>
-      </div>
-    </section>
+                    <button
+                      type="button"
+                      class="qr-trigger"
+                      :disabled="isGeneratingShareQr"
+                      @click="openShareQrDialog"
+                    >
+                      <img
+                        v-if="shareQrDataUrl"
+                        :src="shareQrDataUrl"
+                        alt="分享 QR Code"
+                        class="qr-thumb"
+                      />
+                      <div v-else class="qr-thumb qr-thumb--placeholder">
+                        <v-progress-circular
+                          v-if="isGeneratingShareQr"
+                          indeterminate
+                          size="22"
+                          width="2"
+                          color="primary"
+                        />
+                        <v-icon v-else icon="mdi-qrcode" size="30" />
+                      </div>
+                      <span class="qr-trigger__label">掃描分享</span>
+                    </button>
+                  </v-card-text>
+                </v-card>
 
-    <section class="panel">
-      <h2>分享統計</h2>
-      <p class="sub">下載端數量、HTTP 上傳量與清單同步狀態</p>
+                <v-dialog v-model="qrDialogOpen" max-width="460">
+                  <v-card rounded="xl">
+                    <v-card-title
+                      class="d-flex align-center justify-space-between"
+                    >
+                      <span>分享 QR Code</span>
+                      <v-btn
+                        icon="mdi-close"
+                        variant="text"
+                        @click="qrDialogOpen = false"
+                      />
+                    </v-card-title>
+                    <v-card-text class="text-center">
+                      <div class="text-body-2 text-medium-emphasis mb-4">
+                        已自動複製分享 URL，對方可掃描 QR Code 或直接貼上連結。
+                      </div>
+                      <img
+                        v-if="shareQrDataUrl"
+                        :src="shareQrDataUrl"
+                        alt="大型分享 QR Code"
+                        class="qr-dialog-image"
+                      />
+                      <div v-else class="py-8">
+                        <v-progress-circular indeterminate color="primary" />
+                      </div>
+                      <v-sheet
+                        border
+                        rounded="lg"
+                        color="surface-variant"
+                        class="mt-4 pa-3 text-left"
+                      >
+                        <div class="text-caption text-medium-emphasis mb-1">
+                          分享 URL
+                        </div>
+                        <div class="text-body-2 share-url-text">
+                          {{ shareStatus?.serverUrl }}
+                        </div>
+                      </v-sheet>
+                    </v-card-text>
+                  </v-card>
+                </v-dialog>
 
-      <div class="meta">
-        <p><strong>目前下載端數量：</strong>{{ metrics.activeClientCount }}</p>
-        <p>
-          <strong>累計 HTTP 上傳量：</strong
-          >{{ metrics.httpUploadedBytes }} bytes
-        </p>
-        <p><strong>目前清單版本：</strong>{{ metrics.metadataRevision }}</p>
-        <p><strong>最近活動：</strong>{{ metrics.lastActivityUnixMs || 0 }}</p>
-      </div>
+                <v-card
+                  v-if="isProcessing && processingProgress"
+                  class="mt-4"
+                  variant="tonal"
+                >
+                  <v-card-title class="text-subtitle-1"
+                    >正在處理檔案</v-card-title
+                  >
+                  <v-card-text>
+                    <div class="text-body-2 mb-2">
+                      {{ processingProgress.currentFileIndex }} /
+                      {{ processingProgress.totalFiles }} ・
+                      {{ processingProgress.currentFileName }}
+                    </div>
+                    <UiProgressBar
+                      :value="processingProgress.percentage"
+                      color="info"
+                      :caption="`${formatBytes(processingProgress.bytesProcessed)} / ${formatBytes(processingProgress.totalBytes)}`"
+                    />
+                  </v-card-text>
+                </v-card>
 
-      <p class="warn">
-        使用者端下載頁會每 5
-        秒主動更新檔案清單；分享中新增檔案後，下載頁可自動同步新清單。
-      </p>
-    </section>
-  </main>
+                <v-card
+                  v-if="shareStatus?.session"
+                  class="mt-4"
+                  variant="outlined"
+                >
+                  <v-card-title class="text-subtitle-1"
+                    >目前分享檔案</v-card-title
+                  >
+                  <v-card-subtitle>
+                    {{ shareStatus.session.fileCount }} 個檔案 ・
+                    {{ formatBytes(shareStatus.session.totalSize) }} ・ 版本
+                    {{ shareStatus.session.revision }}
+                  </v-card-subtitle>
+                  <v-data-table
+                    :items="activeFiles"
+                    :headers="[
+                      { title: '檔名', value: 'fileName' },
+                      { title: '大小', value: 'fileSize' },
+                      { title: 'Piece', value: 'pieceCount' },
+                    ]"
+                    :items-per-page="5"
+                    density="comfortable"
+                  >
+                    <template #item.fileSize="{ item }">
+                      {{ formatBytes(item.fileSize) }}
+                    </template>
+                  </v-data-table>
+                </v-card>
+              </v-card-text>
+            </v-card>
+          </v-col>
+
+          <v-col cols="12" lg="4">
+            <v-card rounded="xl" class="mb-4" variant="elevated">
+              <v-card-title class="text-h6">狀態摘要</v-card-title>
+              <v-card-subtitle>即時資訊</v-card-subtitle>
+              <v-list lines="two" density="comfortable">
+                <v-list-item
+                  title="分享狀態"
+                  :subtitle="insights.shareState"
+                  prepend-icon="mdi-broadcast"
+                />
+                <v-list-item
+                  title="可達性"
+                  :subtitle="insights.reachability"
+                  prepend-icon="mdi-lan-connect"
+                />
+                <v-list-item
+                  title="活躍下載"
+                  :subtitle="`${insights.activeDownloads} 個`"
+                  prepend-icon="mdi-download-network"
+                />
+                <v-list-item
+                  title="最近活動"
+                  :subtitle="insights.recentActivityLabel"
+                  prepend-icon="mdi-timeline-clock"
+                />
+                <v-list-item
+                  title="建議下一步"
+                  :subtitle="insights.nextActionHint"
+                  prepend-icon="mdi-lightbulb-on-outline"
+                />
+              </v-list>
+              <v-divider />
+              <v-card-text>
+                <div class="text-body-2 mb-1">
+                  目前下載端數量：<strong>{{
+                    metrics.activeClientCount
+                  }}</strong>
+                </div>
+                <div class="text-body-2 mb-1">
+                  累計 HTTP 上傳：<strong>{{
+                    formatBytes(metrics.httpUploadedBytes)
+                  }}</strong>
+                </div>
+                <div class="text-body-2 mb-1">
+                  清單版本：<strong>{{ metrics.metadataRevision }}</strong>
+                </div>
+                <div class="text-body-2">
+                  最近活動時間：<strong>{{
+                    formatTime(metrics.lastActivityUnixMs)
+                  }}</strong>
+                </div>
+                <v-alert
+                  v-if="insights.recentError"
+                  type="error"
+                  variant="tonal"
+                  density="compact"
+                  class="mt-3"
+                >
+                  近期錯誤：{{ insights.recentError }}
+                </v-alert>
+              </v-card-text>
+            </v-card>
+          </v-col>
+        </v-row>
+      </v-container>
+    </v-main>
+  </v-app>
 </template>
 
 <style scoped>
-.page {
+.main-bg {
   min-height: 100vh;
-  margin: 0;
-  padding: 24px;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 16px;
-  background: linear-gradient(135deg, #f0f7ff 0%, #eafbea 45%, #fff5dd 100%);
-  color: #17324d;
+  background:
+    radial-gradient(
+      circle at 12% 18%,
+      rgba(16, 185, 129, 0.16),
+      transparent 36%
+    ),
+    radial-gradient(
+      circle at 88% 12%,
+      rgba(249, 115, 22, 0.16),
+      transparent 30%
+    ),
+    linear-gradient(135deg, #f5f7f2 0%, #f4faf9 42%, #f8f5ef 100%);
 }
 
-.panel {
-  background: #ffffffd9;
-  border: 1px solid #b8cfe0;
-  border-radius: 14px;
-  padding: 18px;
-  box-shadow: 0 8px 22px rgba(25, 44, 68, 0.1);
+.share-url-block {
+  flex: 1 1 360px;
+  min-width: 0;
 }
 
-h1,
-h2 {
-  margin: 0 0 8px;
-  font-family: "IBM Plex Sans", "Noto Sans TC", sans-serif;
+.share-url-text {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
-.sub {
-  margin-top: 0;
-  color: #446581;
-}
-
-.field-row {
-  display: flex;
-  gap: 8px;
-  margin: 10px 0;
-}
-
-input,
-button {
-  border-radius: 10px;
-  border: 1px solid #8cb2cb;
-  padding: 10px 12px;
-  font-size: 14px;
-}
-
-input {
-  flex: 1;
-}
-
-button {
-  cursor: pointer;
-  background: #1e6fb9;
-  color: #fff;
-  border-color: #1e6fb9;
-}
-
-button.ghost {
-  background: #fff;
-  color: #1e6fb9;
-}
-
-.status,
-.meta {
-  background: #f7fbff;
-  border: 1px dashed #acc8dd;
-  border-radius: 10px;
-  padding: 10px;
-}
-
-.file-list {
-  list-style: none;
-  padding: 0;
-  margin: 8px 0 0;
+.qr-trigger {
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: 8px;
+  border: 0;
+  border-radius: 18px;
+  padding: 10px;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.95),
+    rgba(232, 245, 241, 0.95)
+  );
+  box-shadow: inset 0 0 0 1px rgba(15, 118, 110, 0.16);
+  cursor: pointer;
+  transition:
+    transform 0.18s ease,
+    box-shadow 0.18s ease;
 }
 
-.file-list li {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 10px;
-  background: #fff;
-  border: 1px solid #d7e6f0;
-  border-radius: 8px;
+.qr-trigger:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 0 0 1px rgba(15, 118, 110, 0.24),
+    0 10px 24px rgba(15, 23, 42, 0.1);
 }
 
-.file-list.compact li {
-  font-size: 13px;
+.qr-trigger:disabled {
+  cursor: wait;
 }
 
-.small {
-  padding: 6px 10px;
-  font-size: 12px;
-}
-
-.warn {
-  color: #915900;
-}
-
-@media (max-width: 720px) {
-  .field-row {
-    flex-direction: column;
-  }
-}
-
-.processing {
-  background: #f0f8ff;
-  border: 1px solid #7eb3d4;
-  border-radius: 10px;
-  padding: 16px;
-  margin: 12px 0 0 0;
-  animation: pulse 1.5s ease-in-out infinite;
-}
-
-.processing p {
-  margin: 0 0 8px 0;
-  font-weight: 600;
-  color: #0d47a1;
-}
-
-.progress-info {
-  font-size: 12px;
-  color: #446581;
-  font-weight: normal;
-  margin-bottom: 10px;
-}
-
-.progress-bar-container {
-  width: 100%;
-  height: 24px;
-  background: #e0eef8;
-  border-radius: 12px;
-  overflow: hidden;
-  border: 1px solid #7eb3d4;
-  position: relative;
-}
-
-.progress-bar {
-  height: 100%;
-  background: linear-gradient(90deg, #1e6fb9 0%, #2e8fc9 100%);
-  width: 0%;
-  transition: width 0.3s ease;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 11px;
-}
-
-.progress-text {
-  color: #fff;
+.qr-trigger__label {
   font-size: 12px;
   font-weight: 600;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  color: rgb(15, 118, 110);
 }
 
-@keyframes pulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 rgba(30, 111, 185, 0.3);
-  }
-  50% {
-    box-shadow: 0 0 0 8px rgba(30, 111, 185, 0);
-  }
+.qr-thumb,
+.qr-thumb--placeholder {
+  width: 78px;
+  height: 78px;
+  border-radius: 14px;
+  background: white;
+}
+
+.qr-thumb {
+  display: block;
+  object-fit: cover;
+}
+
+.qr-thumb--placeholder {
+  display: grid;
+  place-items: center;
+  color: rgb(15, 118, 110);
+}
+
+.qr-dialog-image {
+  display: block;
+  width: min(100%, 280px);
+  margin: 0 auto;
+  border-radius: 20px;
+  background: white;
+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.12);
 }
 </style>
