@@ -16,6 +16,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   validate:
     name: Validate release inputs
@@ -55,15 +58,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 10
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
@@ -118,7 +121,7 @@ jobs:
           Compress-Archive -Path "release/${{ matrix.platform.binary_name }}" -DestinationPath "mesh-p2p-${{ github.event.inputs.tag }}-${{ matrix.platform.archive_suffix }}.${{ matrix.platform.archive_extension }}" -Force
 
       - name: Upload packaged artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.platform.artifact_name }}
           path: mesh-p2p-${{ github.event.inputs.tag }}-${{ matrix.platform.archive_suffix }}.${{ matrix.platform.archive_extension }}
@@ -133,7 +136,7 @@ jobs:
 
     steps:
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist-artifacts
 
