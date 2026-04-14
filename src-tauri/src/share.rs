@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::{SocketAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -9,13 +9,15 @@ use std::{
 use axum::{
     extract::ConnectInfo,
     extract::Path as AxumPath,
+    extract::Query,
     extract::State as AxumState,
     http::StatusCode,
     response::{Html, IntoResponse},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tauri::{State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
@@ -23,10 +25,11 @@ use tokio::{fs, io::AsyncReadExt, sync::oneshot};
 
 const DEFAULT_PIECE_SIZE: usize = 256 * 1024;
 const RATE_LIMIT_WINDOW_MS: u64 = 1000;
-const RATE_LIMIT_MAX: usize = 40;
+const RATE_LIMIT_MAX: usize = 5000;
 const CLIENT_ACTIVITY_WINDOW_SECS: u64 = 300;
-const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB chunks for streaming hash
 const METADATA_VERSION: u16 = 1;
+const MIN_SUPPORTED_METADATA_VERSION: u16 = 1;
+const MAX_SUPPORTED_METADATA_VERSION: u16 = METADATA_VERSION;
 const APP_VERSION_PLACEHOLDER: &str = "__APP_VERSION__";
 
 static APP_VERSION: OnceLock<String> = OnceLock::new();
@@ -42,6 +45,10 @@ pub struct SharedFile {
     piece_size: usize,
     piece_count: usize,
     magnet_uri: String,
+    content_signature: String,
+    seed_reused: bool,
+    #[serde(skip_serializing)]
+    torrent_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -62,6 +69,10 @@ pub struct ShareSession {
 pub struct ShareMetrics {
     active_client_count: usize,
     http_uploaded_bytes: u64,
+    p2p_uploaded_bytes: u64,
+    active_p2p_peer_count: usize,
+    fallback_transfer_count: u64,
+    seeding_peer_count: usize,
     metadata_revision: u64,
     last_activity_unix_ms: u128,
 }
@@ -84,6 +95,7 @@ pub struct ShareInsights {
     share_state: String,
     reachability: String,
     active_downloads: usize,
+    seeding_peers: usize,
     recent_error: Option<String>,
     recent_activity_label: String,
     next_action_hint: String,
@@ -120,9 +132,14 @@ struct ShareRuntime {
     tracker_urls: Vec<String>,
     fallback_http_enabled: bool,
     http_uploaded_bytes: u64,
+    p2p_uploaded_bytes: u64,
+    active_p2p_peer_count: usize,
+    fallback_transfer_count: u64,
+    seeding_peer_count: usize,
     metadata_revision: u64,
     last_activity_unix_ms: u128,
     client_activity: VecDeque<ClientActivity>,
+    client_reports: HashMap<String, ClientReportSnapshot>,
     last_error: Option<String>,
     processing_progress: Option<ProcessingProgress>,
     processing_cancel_requested: bool,
@@ -146,16 +163,50 @@ struct ClientActivity {
     seen_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct ClientReportSnapshot {
+    p2p_uploaded_bytes: u64,
+    active_peers: usize,
+    is_seeding: bool,
+    last_seen: Instant,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ErrorResponse {
     error: String,
+    error_code: Option<String>,
+    upgrade_hint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetadataQuery {
+    metadata_version: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientStatsReport {
+    client_id: String,
+    file_id: String,
+    p2p_uploaded_bytes: u64,
+    active_peers: usize,
+    is_seeding: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientStatsAck {
+    accepted: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MetadataResponse {
     metadata_version: u16,
+    min_supported_metadata_version: u16,
+    max_supported_metadata_version: u16,
     session_id: String,
     files: Vec<SharedFile>,
     file_count: usize,
@@ -179,9 +230,14 @@ impl ShareState {
                 tracker_urls,
                 fallback_http_enabled,
                 http_uploaded_bytes: 0,
+                p2p_uploaded_bytes: 0,
+                active_p2p_peer_count: 0,
+                fallback_transfer_count: 0,
+                seeding_peer_count: 0,
                 metadata_revision: 0,
                 last_activity_unix_ms: unix_time_ms(),
                 client_activity: VecDeque::new(),
+                client_reports: HashMap::new(),
                 last_error: None,
                 processing_progress: None,
                 processing_cancel_requested: false,
@@ -236,7 +292,7 @@ pub async fn add_share_files(
         return Err("Please select at least one file to add".to_string());
     }
 
-    let (tracker_urls, existing_paths, next_index, file_count) = {
+    let (tracker_urls, base_url, existing_paths, next_index, file_count) = {
         let guard = state
             .inner
             .lock()
@@ -248,6 +304,11 @@ pub async fn add_share_files(
 
         (
             guard.tracker_urls.clone(),
+            guard
+                .server
+                .as_ref()
+                .map(|server| server.base_url.clone())
+                .ok_or_else(|| "Share server is not running".to_string())?,
             session
                 .files
                 .iter()
@@ -277,8 +338,13 @@ pub async fn add_share_files(
     }
 
     let state_clone = state.inner.clone();
-    let new_files =
-        match build_shared_files(file_paths, &tracker_urls, &existing_paths, next_index, {
+    let new_files = match build_shared_files(
+        file_paths,
+        &tracker_urls,
+        &base_url,
+        &existing_paths,
+        next_index,
+        {
             let state = state_clone.clone();
             move |file_name, file_idx, file_total_size, bytes_processed| {
                 let mut guard = state
@@ -302,18 +368,19 @@ pub async fn add_share_files(
 
                 Ok(())
             }
-        })
-        .await
-        {
-            Ok(files) => files,
-            Err(err) => {
-                if let Ok(mut guard) = state.inner.lock() {
-                    guard.last_error = Some(err.clone());
-                    guard.processing_progress = None;
-                }
-                return Err(err);
+        },
+    )
+    .await
+    {
+        Ok(files) => files,
+        Err(err) => {
+            if let Ok(mut guard) = state.inner.lock() {
+                guard.last_error = Some(err.clone());
+                guard.processing_progress = None;
             }
-        };
+            return Err(err);
+        }
+    };
 
     let mut guard = state
         .inner
@@ -376,31 +443,38 @@ pub async fn start_share(
     }
 
     let state_clone = state.inner.clone();
-    let files = match build_shared_files(file_paths, &tracker_urls, &HashSet::new(), 0, {
-        let state = state_clone.clone();
-        move |file_name, file_idx, file_total_size, bytes_processed| {
-            let mut guard = state
-                .lock()
-                .map_err(|_| "State lock poisoned".to_string())?;
+    let files = match build_shared_files(
+        file_paths,
+        &tracker_urls,
+        &server_url,
+        &HashSet::new(),
+        0,
+        {
+            let state = state_clone.clone();
+            move |file_name, file_idx, file_total_size, bytes_processed| {
+                let mut guard = state
+                    .lock()
+                    .map_err(|_| "State lock poisoned".to_string())?;
 
-            if guard.processing_cancel_requested {
-                return Err("分享已停止".to_string());
-            }
-
-            if let Some(ref mut progress) = guard.processing_progress {
-                progress.current_file_name = file_name.clone();
-                progress.current_file_index = file_idx;
-                progress.total_bytes = file_total_size;
-                progress.bytes_processed = bytes_processed;
-                if file_total_size > 0 {
-                    progress.percentage =
-                        ((bytes_processed as f64 / file_total_size as f64) * 100.0) as u8;
+                if guard.processing_cancel_requested {
+                    return Err("分享已停止".to_string());
                 }
-            }
 
-            Ok(())
-        }
-    })
+                if let Some(ref mut progress) = guard.processing_progress {
+                    progress.current_file_name = file_name.clone();
+                    progress.current_file_index = file_idx;
+                    progress.total_bytes = file_total_size;
+                    progress.bytes_processed = bytes_processed;
+                    if file_total_size > 0 {
+                        progress.percentage =
+                            ((bytes_processed as f64 / file_total_size as f64) * 100.0) as u8;
+                    }
+                }
+
+                Ok(())
+            }
+        },
+    )
     .await
     {
         Ok(files) => files,
@@ -422,7 +496,7 @@ pub async fn start_share(
         revision: 1,
         last_updated_unix_ms: started_at,
         files,
-        tracker_urls,
+        tracker_urls: tracker_urls.to_vec(),
         started_at_unix_ms: started_at,
     };
 
@@ -432,10 +506,15 @@ pub async fn start_share(
             .lock()
             .map_err(|_| "State lock poisoned".to_string())?;
         guard.http_uploaded_bytes = 0;
+        guard.p2p_uploaded_bytes = 0;
+        guard.active_p2p_peer_count = 0;
+        guard.fallback_transfer_count = 0;
+        guard.seeding_peer_count = 0;
         guard.metadata_revision = 1;
         guard.last_activity_unix_ms = started_at;
         guard.last_error = None;
         guard.client_activity.clear();
+        guard.client_reports.clear();
         guard.processing_progress = None; // Clear progress after completion
         guard.processing_cancel_requested = false;
         guard.session = Some(session.clone());
@@ -456,6 +535,10 @@ pub async fn stop_share(state: State<'_, ShareState>) -> Result<bool, String> {
     let existed = guard.session.is_some() || guard.processing_progress.is_some();
     guard.processing_cancel_requested = true;
     guard.processing_progress = None;
+    guard.client_reports.clear();
+    guard.seeding_peer_count = 0;
+    guard.p2p_uploaded_bytes = 0;
+    guard.active_p2p_peer_count = 0;
     guard.session = None;
     Ok(existed)
 }
@@ -513,10 +596,15 @@ async fn ensure_server_running(runtime: Arc<Mutex<ShareRuntime>>) -> Result<Stri
 
     let router = Router::new()
         .route("/", get(download_page_handler))
+        .route("/webtorrent.min.js", get(webtorrent_js_handler))
+        .route("/mesh.png", get(mesh_png_handler))
         .route("/api/metadata", get(metadata_handler))
+        .route("/api/client-stats", post(client_stats_handler))
+        .route("/api/torrent/{file_id}", get(torrent_handler))
         .route("/api/file/{file_id}", get(file_handler))
         .route("/api/health", get(health_handler))
-        .with_state(http_state);
+        .with_state(http_state)
+        .layer(tower_http::cors::CorsLayer::permissive());
 
     let tokio_listener = tokio::net::TcpListener::from_std(listener)
         .map_err(|e| format!("Failed to convert listener: {e}"))?;
@@ -571,6 +659,46 @@ fn enforce_rate_limit(state: &HttpState) -> Result<(), StatusCode> {
     Ok(())
 }
 
+static WEBTORRENT_JS_RAW: &[u8] =
+    include_bytes!("../../node_modules/webtorrent/dist/webtorrent.min.js");
+static WEBTORRENT_JS_PATCHED: OnceLock<String> = OnceLock::new();
+static MESH_PNG: &[u8] = include_bytes!("../icons/mesh.png");
+
+fn get_webtorrent_js() -> &'static str {
+    WEBTORRENT_JS_PATCHED.get_or_init(|| {
+        let src = std::str::from_utf8(WEBTORRENT_JS_RAW).expect("webtorrent.min.js is valid UTF-8");
+        // The file ends with ES module `export{X as default}` — patch to a global assignment
+        // so it can be used as a classic <script> without type="module"
+        if let Some(pos) = src.rfind("export{") {
+            if let Some(close_offset) = src[pos..].find('}') {
+                let inner = &src[pos + 7..pos + close_offset]; // e.g. "Kt as default"
+                let var_name = inner.split_whitespace().next().unwrap_or("_WT");
+                return format!("{}globalThis.WebTorrent={};", &src[..pos], var_name);
+            }
+        }
+        src.to_string()
+    })
+}
+
+async fn webtorrent_js_handler() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/javascript"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        get_webtorrent_js(),
+    )
+}
+
+async fn mesh_png_handler() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        MESH_PNG,
+    )
+}
+
 async fn download_page_handler() -> impl IntoResponse {
     Html(
         r#"<!doctype html>
@@ -598,6 +726,37 @@ async fn download_page_handler() -> impl IntoResponse {
 
         <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/vuetify@3.10.8/dist/vuetify.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/js-sha1@0.6.0/src/sha1.min.js"></script>
+        <script>
+            // Polyfill Web Crypto API for insecure contexts (LAN HTTP)
+            if (!window.crypto) window.crypto = {};
+            if (!window.crypto.getRandomValues) {
+                window.crypto.getRandomValues = function(buf) {
+                    for (let i = 0; i < buf.length; i++) buf[i] = Math.floor(Math.random() * 256);
+                    return buf;
+                };
+            }
+            if (!window.crypto.subtle) window.crypto.subtle = {};
+            if (!window.crypto.subtle.digest) {
+                window.crypto.subtle.digest = function(algo, data) {
+                    return new Promise((resolve, reject) => {
+                        try {
+                            const isSha1 = typeof algo === 'string' 
+                                ? algo.toUpperCase() === 'SHA-1' 
+                                : (algo && algo.name && algo.name.toUpperCase() === 'SHA-1');
+                            if (isSha1) {
+                                resolve(sha1.arrayBuffer(data));
+                            } else {
+                                reject(new Error('Polyfill only supports SHA-1'));
+                            }
+                        } catch (e) {
+                            reject(e);
+                        }
+                    });
+                };
+            }
+        </script>
+        <script src="/webtorrent.min.js"></script>
         <script>
             const { createApp, ref, computed, onMounted, onUnmounted } = Vue;
             const { createVuetify } = Vuetify;
@@ -633,6 +792,9 @@ async fn download_page_handler() -> impl IntoResponse {
                 return Date.now();
             }
 
+            const SUPPORTED_METADATA_VERSION = 1;
+            const CLIENT_ID = `dl-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+
             createApp({
                 setup() {
                     const statusText = ref('載入中...');
@@ -642,8 +804,20 @@ async fn download_page_handler() -> impl IntoResponse {
                     const lastRevision = ref(-1);
                     const timerId = ref(null);
                     const downloads = ref({});
+                    let torrentClient = null;
+                    const torrentSessions = {};
 
                     const files = computed(() => metadata.value?.files ?? []);
+
+                    function ensureClient() {
+                        if (!torrentClient) {
+                            if (!globalThis.WebTorrent) {
+                                throw new Error('WebTorrent client unavailable');
+                            }
+                            torrentClient = new globalThis.WebTorrent();
+                        }
+                        return torrentClient;
+                    }
 
                     function ensureDownloadState(fileId) {
                         if (!downloads.value[fileId]) {
@@ -664,14 +838,50 @@ async fn download_page_handler() -> impl IntoResponse {
                         return downloads.value[fileId];
                     }
 
+                    async function reportClientStats(file, torrent, isSeeding) {
+                        try {
+                            const resp = await fetch('/api/client-stats', {
+                                method: 'POST',
+                                headers: {
+                                    'content-type': 'application/json',
+                                },
+                                body: JSON.stringify({
+                                    clientId: CLIENT_ID,
+                                    fileId: file.fileId,
+                                    p2pUploadedBytes: Math.round(torrent.uploaded || 0),
+                                    activePeers: Number(torrent.numPeers || 0),
+                                    isSeeding,
+                                }),
+                                keepalive: true,
+                            });
+
+                            if (resp.status === 410) {
+                                warningText.value = '分享已停止，正在回收既有 P2P session';
+                                destroyAllSessions();
+                            }
+                        } catch (error) {
+                            warningText.value = String(error);
+                        }
+                    }
+
                     async function loadMetadata() {
                         metadataError.value = '';
                         warningText.value = '';
                         try {
-                            const resp = await fetch('/api/metadata', { cache: 'no-store' });
+                            const resp = await fetch(`/api/metadata?metadataVersion=${SUPPORTED_METADATA_VERSION}`, { cache: 'no-store' });
                             if (!resp.ok) {
+                                let errMsg = '目前沒有可用分享。';
+                                try {
+                                    const errData = await resp.json();
+                                    if (errData?.errorCode === 'METADATA_VERSION_UNSUPPORTED') {
+                                        errMsg = `${errData.error} ${errData.upgradeHint || ''}`.trim();
+                                    }
+                                } catch (_) {
+                                }
                                 statusText.value = '目前沒有可用分享。';
+                                metadataError.value = errMsg;
                                 metadata.value = null;
+                                destroyAllSessions();
                                 return;
                             }
 
@@ -698,6 +908,109 @@ async fn download_page_handler() -> impl IntoResponse {
                         }
                     }
 
+                    function destroySession(fileId, nextPhase = 'idle') {
+                        const session = torrentSessions[fileId];
+                        if (!session) {
+                            return;
+                        }
+                        if (session.tickId) {
+                            clearInterval(session.tickId);
+                        }
+                        if (session.torrent) {
+                            void reportClientStats(session.file, session.torrent, false);
+                            session.torrent.destroy({ destroyStore: false }, () => {});
+                        }
+                        delete torrentSessions[fileId];
+
+                        const state = ensureDownloadState(fileId);
+                        state.phase = nextPhase;
+                        state.speedBps = 0;
+                        state.etaSeconds = 0;
+                        state.sourceMix = '已停止';
+                    }
+
+                    function destroyAllSessions() {
+                        Object.keys(torrentSessions).forEach((fileId) => {
+                            destroySession(fileId, 'idle');
+                        });
+                        if (torrentClient) {
+                            torrentClient.destroy(() => {});
+                            torrentClient = null;
+                        }
+                    }
+
+                    async function fetchTorrentBytes(fileId) {
+                        const resp = await fetch(`/api/torrent/${fileId}`);
+                        if (!resp.ok) {
+                            throw new Error(`取得 torrent 描述失敗：HTTP ${resp.status}`);
+                        }
+                        const buffer = await resp.arrayBuffer();
+                        // WebTorrent 在瀏覽器中只接受 Blob、字串(URL/Magnet) 等；
+                        // Uint8Array 會被誤認為無效的識別碼而拋出 "Invalid torrent identifier"。
+                        if (typeof Buffer !== 'undefined') {
+                            return Buffer.from(buffer);
+                        }
+                        return new Blob([buffer], { type: 'application/x-bittorrent' });
+                    }
+
+                    function updateStateFromTorrent(file, torrent) {
+                        const state = ensureDownloadState(file.fileId);
+                        state.totalBytes = torrent.length || file.fileSize || 0;
+                        state.bytesReceived = torrent.downloaded || 0;
+                        state.progressPercent = state.totalBytes > 0
+                            ? Math.min(100, Math.round((state.bytesReceived / state.totalBytes) * 100))
+                            : 0;
+                        state.speedBps = Math.round(torrent.downloadSpeed || 0);
+                        state.etaSeconds = state.speedBps > 0 && state.totalBytes > state.bytesReceived
+                            ? Math.ceil((state.totalBytes - state.bytesReceived) / state.speedBps)
+                            : 0;
+                        state.sourceMix = torrent.numPeers > 0 ? 'P2P + HTTP web seed' : 'HTTP web seed fallback';
+                        state.lastTickAt = nowMs();
+                        void reportClientStats(file, torrent, state.phase === 'seeding' || torrent.progress === 1);
+                    }
+
+                    function persistTorrentFile(file, torrent) {
+                        return new Promise((resolve, reject) => {
+                            const target = torrent.files?.find((entry) => entry.name === file.fileName) || torrent.files?.[0];
+                            if (!target) {
+                                reject(new Error('torrent 內容為空'));
+                                return;
+                            }
+                            
+                            if (typeof target.blob === 'function') {
+                                target.blob().then(blob => {
+                                    saveBlob(file.fileName, blob);
+                                    resolve();
+                                }).catch(reject);
+                            } else if (typeof target.getBlob === 'function') {
+                                target.getBlob((error, blob) => {
+                                    if (error) {
+                                        reject(error);
+                                        return;
+                                    }
+                                    saveBlob(file.fileName, blob);
+                                    resolve();
+                                });
+                            } else if (typeof target.getBlobURL === 'function') {
+                                target.getBlobURL((error, url) => {
+                                    if (error) {
+                                        reject(error);
+                                    } else {
+                                        const link = document.createElement('a');
+                                        link.href = url;
+                                        link.download = file.fileName;
+                                        document.body.appendChild(link);
+                                        link.click();
+                                        link.remove();
+                                        resolve();
+                                    }
+                                });
+                            } else {
+                                reject(new Error('無法獲取下載檔案 (WebTorrent API 不支援)'));
+                            }
+                        });
+                    }
+
                     function saveBlob(fileName, blob) {
                         const url = URL.createObjectURL(blob);
                         const link = document.createElement('a');
@@ -711,7 +1024,7 @@ async fn download_page_handler() -> impl IntoResponse {
 
                     async function downloadFile(file) {
                         const state = ensureDownloadState(file.fileId);
-                        if (state.phase === 'downloading') {
+                        if (state.phase === 'downloading' || state.phase === 'seeding') {
                             return;
                         }
 
@@ -727,53 +1040,62 @@ async fn download_page_handler() -> impl IntoResponse {
                         state.smoothedSpeedBps = 0;
 
                         try {
-                            const resp = await fetch(`/api/file/${file.fileId}`);
-                            if (!resp.ok || !resp.body) {
-                                throw new Error(`下載失敗：HTTP ${resp.status}`);
-                            }
+                            const client = ensureClient();
+                            // 永遠使用 .torrent bytes：包含完整 metadata（pieces 雜湊值），
+                            // web seed 才能在無 P2P peer 的 LAN 環境下正常下載。
+                            // 若改用 magnet URI，WebTorrent 需要先向 peer 取 metadata，
+                            // 在沒有外部 peer 的情況下永遠卡在 0%。
+                            const torrentBytes = await fetchTorrentBytes(file.fileId);
 
-                            const contentLength = Number(resp.headers.get('content-length') || file.fileSize || 0);
-                            state.totalBytes = contentLength;
+                            const torrent = client.add(torrentBytes, { destroyStoreOnDestroy: false });
+                            // error handler 必須最先附上，避免 EventEmitter 在 handler 尚未
+                            // 附上前發出 'error' 事件而變成 Uncaught 錯誤。
+                            torrent.on('error', (error) => {
+                                destroySession(file.fileId, 'error');
+                                state.errorCode = String(error);
+                            });
 
-                            const reader = resp.body.getReader();
-                            const chunks = [];
+                            const tickId = setInterval(() => updateStateFromTorrent(file, torrent), 1000);
+                            torrentSessions[file.fileId] = { file, torrent, tickId };
 
-                            while (true) {
-                                const { done, value } = await reader.read();
-                                if (done) break;
-                                chunks.push(value);
-                                state.bytesReceived += value.length;
-
-                                const now = nowMs();
-                                const elapsed = Math.max((now - state.lastTickAt) / 1000, 0.001);
-                                const instSpeed = value.length / elapsed;
-                                state.smoothedSpeedBps = state.smoothedSpeedBps
-                                    ? state.smoothedSpeedBps * 0.7 + instSpeed * 0.3
-                                    : instSpeed;
-                                state.speedBps = Math.round(state.smoothedSpeedBps);
-
-                                if (state.totalBytes > 0) {
-                                    state.progressPercent = Math.min(
-                                        100,
-                                        Math.round((state.bytesReceived / state.totalBytes) * 100),
-                                    );
-                                    const remain = Math.max(0, state.totalBytes - state.bytesReceived);
-                                    state.etaSeconds = state.speedBps > 0 ? Math.ceil(remain / state.speedBps) : 0;
+                            torrent.on('download', () => updateStateFromTorrent(file, torrent));
+                            torrent.on('wire', () => updateStateFromTorrent(file, torrent));
+                            torrent.on('warning', (warning) => {
+                                const msg = String(warning);
+                                // 過濾 tracker WebSocket 連線失敗（LAN 環境下外部 tracker 必然失敗，非真正錯誤）
+                                if (!msg.includes('WebSocket') && !msg.includes('tracker') && !msg.includes('wss://')) {
+                                    warningText.value = msg;
                                 }
-                                state.lastTickAt = now;
-                            }
-
-                            saveBlob(file.fileName, new Blob(chunks, { type: 'application/octet-stream' }));
-                            state.phase = 'downloaded';
-                            state.progressPercent = 100;
-                            state.etaSeconds = 0;
+                                updateStateFromTorrent(file, torrent);
+                            });
+                            torrent.on('done', async () => {
+                                updateStateFromTorrent(file, torrent);
+                                try {
+                                    await persistTorrentFile(file, torrent);
+                                    state.phase = 'seeding';
+                                    state.progressPercent = 100;
+                                    state.etaSeconds = 0;
+                                    state.sourceMix = torrent.numPeers > 0 ? 'P2P seeding' : 'HTTP web seed 完成';
+                                    void reportClientStats(file, torrent, true);
+                                } catch (error) {
+                                    state.phase = 'error';
+                                    state.errorCode = String(error);
+                                }
+                            });
                         } catch (error) {
                             state.phase = 'error';
                             state.errorCode = String(error);
                         }
                     }
 
+                    function stopTransfer(fileId) {
+                        const state = ensureDownloadState(fileId);
+                        const nextPhase = (state.bytesReceived >= state.totalBytes && state.totalBytes > 0) ? 'downloaded' : 'idle';
+                        destroySession(fileId, nextPhase);
+                    }
+
                     function phaseColor(phase) {
+                        if (phase === 'seeding') return 'success';
                         if (phase === 'downloaded') return 'secondary';
                         if (phase === 'downloading') return 'info';
                         if (phase === 'error') return 'error';
@@ -781,6 +1103,7 @@ async fn download_page_handler() -> impl IntoResponse {
                     }
 
                     function phaseLabel(phase) {
+                        if (phase === 'seeding') return '已下載並分享中';
                         if (phase === 'downloaded') return '已下載';
                         if (phase === 'downloading') return '下載中';
                         if (phase === 'error') return '失敗';
@@ -796,6 +1119,7 @@ async fn download_page_handler() -> impl IntoResponse {
                         if (timerId.value) {
                             clearInterval(timerId.value);
                         }
+                        destroyAllSessions();
                     });
 
                     return {
@@ -807,6 +1131,7 @@ async fn download_page_handler() -> impl IntoResponse {
                         downloads,
                         loadMetadata,
                         downloadFile,
+                        stopTransfer,
                         phaseColor,
                         phaseLabel,
                         formatBytes,
@@ -866,11 +1191,10 @@ async fn download_page_handler() -> impl IntoResponse {
 
                                                         <v-btn
                                                             size="small"
-                                                            color="primary"
-                                                            :disabled="downloads[file.fileId]?.phase === 'downloading'"
-                                                            @click="downloadFile(file)"
+                                                            :color="downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading' ? 'warning' : 'primary'"
+                                                            @click="downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading' ? stopTransfer(file.fileId) : downloadFile(file)"
                                                         >
-                                                            下載
+                                                            {{ downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading' ? '停止' : '下載' }}
                                                         </v-btn>
                                                     </div>
                                                 </template>
@@ -891,6 +1215,9 @@ async fn download_page_handler() -> impl IntoResponse {
                                                             {{ formatBytes(downloads[file.fileId]?.totalBytes || file.fileSize) }} ・
                                                             {{ formatBytes(downloads[file.fileId]?.speedBps || 0) }}/s ・
                                                             ETA {{ downloads[file.fileId]?.etaSeconds || 0 }}s
+                                                        </div>
+                                                        <div v-if="downloads[file.fileId]?.phase === 'downloading' || downloads[file.fileId]?.phase === 'seeding'" class="tiny mt-1">
+                                                            {{ downloads[file.fileId]?.sourceMix || 'P2P + HTTP web seed' }}
                                                         </div>
                                                         <div v-if="downloads[file.fileId]?.phase === 'error'" class="tiny" style="color:#b91c1c">
                                                             {{ downloads[file.fileId]?.errorCode }}
@@ -916,6 +1243,7 @@ async fn download_page_handler() -> impl IntoResponse {
 }
 
 async fn metadata_handler(
+    Query(query): Query<MetadataQuery>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumState(state): AxumState<HttpState>,
 ) -> impl IntoResponse {
@@ -924,9 +1252,31 @@ async fn metadata_handler(
             status,
             Json(ErrorResponse {
                 error: "Rate limit exceeded".to_string(),
+                error_code: None,
+                upgrade_hint: None,
             }),
         )
             .into_response();
+    }
+
+    if let Some(client_version) = query.metadata_version {
+        if !(MIN_SUPPORTED_METADATA_VERSION..=MAX_SUPPORTED_METADATA_VERSION)
+            .contains(&client_version)
+        {
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Unsupported metadata version: {client_version}. Supported range: {MIN_SUPPORTED_METADATA_VERSION}..={MAX_SUPPORTED_METADATA_VERSION}"
+                    ),
+                    error_code: Some("METADATA_VERSION_UNSUPPORTED".to_string()),
+                    upgrade_hint: Some(format!(
+                        "Please upgrade download page to metadataVersion={MAX_SUPPORTED_METADATA_VERSION}"
+                    )),
+                }),
+            )
+                .into_response();
+        }
     }
 
     let mut guard = match state.runtime.lock() {
@@ -936,6 +1286,8 @@ async fn metadata_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: "State lock poisoned".to_string(),
+                    error_code: None,
+                    upgrade_hint: None,
                 }),
             )
                 .into_response();
@@ -957,6 +1309,8 @@ async fn metadata_handler(
             StatusCode::GONE,
             Json(ErrorResponse {
                 error: "Share session is not active".to_string(),
+                error_code: None,
+                upgrade_hint: None,
             }),
         )
             .into_response(),
@@ -964,6 +1318,7 @@ async fn metadata_handler(
 }
 
 async fn file_handler(
+    headers: axum::http::HeaderMap,
     AxumPath(file_id): AxumPath<String>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumState(state): AxumState<HttpState>,
@@ -973,6 +1328,8 @@ async fn file_handler(
             status,
             Json(ErrorResponse {
                 error: "Rate limit exceeded".to_string(),
+                error_code: None,
+                upgrade_hint: None,
             }),
         )
             .into_response();
@@ -986,6 +1343,8 @@ async fn file_handler(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
                         error: "State lock poisoned".to_string(),
+                        error_code: None,
+                        upgrade_hint: None,
                     }),
                 )
                     .into_response();
@@ -1002,6 +1361,8 @@ async fn file_handler(
                         StatusCode::NOT_FOUND,
                         Json(ErrorResponse {
                             error: "Shared file not found".to_string(),
+                            error_code: None,
+                            upgrade_hint: None,
                         }),
                     )
                         .into_response();
@@ -1012,6 +1373,8 @@ async fn file_handler(
                     StatusCode::GONE,
                     Json(ErrorResponse {
                         error: "Share session is not active".to_string(),
+                        error_code: None,
+                        upgrade_hint: None,
                     }),
                 )
                     .into_response();
@@ -1019,47 +1382,271 @@ async fn file_handler(
         }
     };
 
-    match fs::read(&file_path).await {
-        Ok(bytes) => {
-            if let Ok(mut guard) = state.runtime.lock() {
-                guard.http_uploaded_bytes += bytes.len() as u64;
-                guard.last_activity_unix_ms = unix_time_ms();
-            }
-
-            let file_name = file_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("download.bin")
-                .to_string();
-
-            (
-                StatusCode::OK,
-                [
-                    (
-                        axum::http::header::CONTENT_TYPE,
-                        "application/octet-stream".to_string(),
-                    ),
-                    (
-                        axum::http::header::CONTENT_DISPOSITION,
-                        format!("attachment; filename=\"{file_name}\""),
-                    ),
-                ],
-                bytes,
+    let mut file = match tokio::fs::File::open(&file_path).await {
+        Ok(f) => f,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to open shared file: {err}"),
+                    error_code: None,
+                    upgrade_hint: None,
+                }),
             )
-                .into_response()
+                .into_response();
         }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to read shared file: {err}"),
-            }),
-        )
-            .into_response(),
+    };
+
+    let metadata = match file.metadata().await {
+        Ok(m) => m,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let file_size = metadata.len();
+
+    let mut start = 0;
+    let mut end = file_size.saturating_sub(1);
+    let mut is_partial = false;
+
+    if let Some(range_value) = headers.get(axum::http::header::RANGE).and_then(|h| h.to_str().ok()) {
+        if range_value.starts_with("bytes=") {
+            let parts: Vec<&str> = range_value["bytes=".len()..].split('-').collect();
+            if !parts.is_empty() {
+                if let Ok(s) = parts[0].parse::<u64>() {
+                    start = s;
+                    is_partial = true;
+                }
+                if parts.len() > 1 && !parts[1].is_empty() {
+                    if let Ok(e) = parts[1].parse::<u64>() {
+                        end = e;
+                    }
+                }
+            }
+        }
+    }
+
+    if start >= file_size && file_size > 0 {
+        let mut res_headers = axum::http::HeaderMap::new();
+        res_headers.insert(axum::http::header::CONTENT_RANGE, format!("bytes */{file_size}").parse().unwrap());
+        return (StatusCode::RANGE_NOT_SATISFIABLE, res_headers, "").into_response();
+    }
+    if end >= file_size {
+        end = file_size.saturating_sub(1);
+    }
+    if start > end {
+        return (StatusCode::RANGE_NOT_SATISFIABLE, "").into_response();
+    }
+
+    let chunk_size = (end - start + 1) as usize;
+    if chunk_size > 200 * 1024 * 1024 {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "Chunk too large, please use Range requests").into_response();
+    }
+
+    use std::io::SeekFrom;
+    use tokio::io::AsyncSeekExt;
+    if file.seek(SeekFrom::Start(start)).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let mut buffer = vec![0; chunk_size];
+    if tokio::io::AsyncReadExt::read_exact(&mut file, &mut buffer).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Ok(mut guard) = state.runtime.lock() {
+        guard.http_uploaded_bytes += chunk_size as u64;
+        guard.fallback_transfer_count += 1;
+        guard.last_activity_unix_ms = unix_time_ms();
+    }
+
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download.bin")
+        .to_string();
+
+    let mut res_headers = axum::http::HeaderMap::new();
+    res_headers.insert(axum::http::header::ACCEPT_RANGES, "bytes".parse().unwrap());
+    res_headers.insert(axum::http::header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+
+    if is_partial {
+        res_headers.insert(axum::http::header::CONTENT_RANGE, format!("bytes {start}-{end}/{file_size}").parse().unwrap());
+        (StatusCode::PARTIAL_CONTENT, res_headers, buffer).into_response()
+    } else {
+        res_headers.insert(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{file_name}\"").parse().unwrap(),
+        );
+        (StatusCode::OK, res_headers, buffer).into_response()
     }
 }
 
 async fn health_handler() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true }))
+}
+
+async fn client_stats_handler(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    AxumState(state): AxumState<HttpState>,
+    Json(report): Json<ClientStatsReport>,
+) -> impl IntoResponse {
+    if let Err(status) = enforce_rate_limit(&state) {
+        return (
+            status,
+            Json(ErrorResponse {
+                error: "Rate limit exceeded".to_string(),
+                error_code: None,
+                upgrade_hint: None,
+            }),
+        )
+            .into_response();
+    }
+
+    let mut guard = match state.runtime.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "State lock poisoned".to_string(),
+                    error_code: None,
+                    upgrade_hint: None,
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    record_client_activity(&mut guard, addr);
+
+    let session = match &guard.session {
+        Some(session) => session,
+        None => {
+            return (
+                StatusCode::GONE,
+                Json(ErrorResponse {
+                    error: "Share session is not active".to_string(),
+                    error_code: Some("SESSION_INACTIVE".to_string()),
+                    upgrade_hint: None,
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    if !session
+        .files
+        .iter()
+        .any(|file| file.file_id == report.file_id)
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Shared file not found".to_string(),
+                error_code: Some("FILE_NOT_FOUND".to_string()),
+                upgrade_hint: None,
+            }),
+        )
+            .into_response();
+    }
+
+    let now = Instant::now();
+    guard.client_reports.insert(
+        report.client_id.clone(),
+        ClientReportSnapshot {
+            p2p_uploaded_bytes: report.p2p_uploaded_bytes,
+            active_peers: report.active_peers,
+            is_seeding: report.is_seeding,
+            last_seen: now,
+        },
+    );
+    rebuild_reported_metrics(&mut guard, now);
+    guard.last_activity_unix_ms = unix_time_ms();
+
+    eprintln!(
+        "client-stats accepted client={} file={} p2p_uploaded_bytes={} active_peers={} is_seeding={}",
+        report.client_id,
+        report.file_id,
+        report.p2p_uploaded_bytes,
+        report.active_peers,
+        report.is_seeding,
+    );
+
+    Json(ClientStatsAck { accepted: true }).into_response()
+}
+
+async fn torrent_handler(
+    AxumPath(file_id): AxumPath<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    AxumState(state): AxumState<HttpState>,
+) -> impl IntoResponse {
+    if let Err(status) = enforce_rate_limit(&state) {
+        return (
+            status,
+            Json(ErrorResponse {
+                error: "Rate limit exceeded".to_string(),
+                error_code: None,
+                upgrade_hint: None,
+            }),
+        )
+            .into_response();
+    }
+
+    let torrent_bytes = {
+        let mut guard = match state.runtime.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "State lock poisoned".to_string(),
+                        error_code: None,
+                        upgrade_hint: None,
+                    }),
+                )
+                    .into_response();
+            }
+        };
+
+        record_client_activity(&mut guard, addr);
+
+        match &guard.session {
+            Some(session) => match session.files.iter().find(|file| file.file_id == file_id) {
+                Some(file) => file.torrent_bytes.clone(),
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse {
+                            error: "Shared torrent descriptor not found".to_string(),
+                            error_code: None,
+                            upgrade_hint: None,
+                        }),
+                    )
+                        .into_response();
+                }
+            },
+            None => {
+                return (
+                    StatusCode::GONE,
+                    Json(ErrorResponse {
+                        error: "Share session is not active".to_string(),
+                        error_code: None,
+                        upgrade_hint: None,
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-bittorrent".to_string(),
+        )],
+        torrent_bytes,
+    )
+        .into_response()
 }
 
 async fn validate_file_path(path: &Path) -> Result<(), String> {
@@ -1087,6 +1674,7 @@ async fn validate_file_path(path: &Path) -> Result<(), String> {
 async fn build_shared_files(
     file_paths: Vec<String>,
     trackers: &[String],
+    base_url: &str,
     existing_paths: &HashSet<String>,
     next_index: usize,
     progress_callback: impl Fn(String, usize, u64, u64) -> Result<(), String> + Send + Clone,
@@ -1108,6 +1696,8 @@ async fn build_shared_files(
             .and_then(|n| n.to_str())
             .unwrap_or("shared-file")
             .to_string();
+        let file_id = format!("file-{}", next_index + offset + 1);
+        let web_seed_url = format!("{base_url}/api/file/{file_id}");
 
         let file_idx = offset + 1;
         let file_total_size = fs::metadata(&path)
@@ -1117,7 +1707,7 @@ async fn build_shared_files(
 
         progress_callback(file_name.clone(), file_idx, file_total_size, 0)?;
 
-        let metadata = build_seed_metadata(&path, trackers, {
+        let metadata = build_seed_metadata(&path, trackers, &web_seed_url, {
             let cb = progress_callback.clone();
             let file_name = file_name.clone();
             move |chunk_bytes| {
@@ -1132,7 +1722,7 @@ async fn build_shared_files(
         .await?;
 
         files.push(SharedFile {
-            file_id: format!("file-{}", next_index + offset + 1),
+            file_id,
             file_name,
             file_path: normalized.clone(),
             file_size: metadata.file_size,
@@ -1140,6 +1730,9 @@ async fn build_shared_files(
             piece_size: metadata.piece_size,
             piece_count: metadata.piece_count,
             magnet_uri: metadata.magnet_uri,
+            content_signature: metadata.content_signature,
+            seed_reused: metadata.seed_reused,
+            torrent_bytes: metadata.torrent_bytes,
         });
         seen.insert(normalized);
     }
@@ -1164,6 +1757,8 @@ fn build_metadata_response(
 ) -> MetadataResponse {
     MetadataResponse {
         metadata_version: METADATA_VERSION,
+        min_supported_metadata_version: MIN_SUPPORTED_METADATA_VERSION,
+        max_supported_metadata_version: MAX_SUPPORTED_METADATA_VERSION,
         session_id: session.session_id.clone(),
         files: session.files.clone(),
         file_count: session.file_count,
@@ -1194,6 +1789,31 @@ fn record_client_activity(runtime: &mut ShareRuntime, addr: SocketAddr) {
     runtime.last_activity_unix_ms = unix_time_ms();
 }
 
+fn prune_client_reports(reports: &mut HashMap<String, ClientReportSnapshot>, now: Instant) {
+    reports.retain(|_, report| {
+        now.duration_since(report.last_seen) <= Duration::from_secs(CLIENT_ACTIVITY_WINDOW_SECS)
+    });
+}
+
+fn rebuild_reported_metrics(runtime: &mut ShareRuntime, now: Instant) {
+    prune_client_reports(&mut runtime.client_reports, now);
+    runtime.p2p_uploaded_bytes = runtime
+        .client_reports
+        .values()
+        .map(|entry| entry.p2p_uploaded_bytes)
+        .sum();
+    runtime.active_p2p_peer_count = runtime
+        .client_reports
+        .values()
+        .map(|entry| entry.active_peers)
+        .sum();
+    runtime.seeding_peer_count = runtime
+        .client_reports
+        .values()
+        .filter(|entry| entry.is_seeding)
+        .count();
+}
+
 fn build_metrics(runtime: &ShareRuntime) -> ShareMetrics {
     let now = Instant::now();
     let active_client_count = runtime
@@ -1209,6 +1829,10 @@ fn build_metrics(runtime: &ShareRuntime) -> ShareMetrics {
     ShareMetrics {
         active_client_count,
         http_uploaded_bytes: runtime.http_uploaded_bytes,
+        p2p_uploaded_bytes: runtime.p2p_uploaded_bytes,
+        active_p2p_peer_count: runtime.active_p2p_peer_count,
+        fallback_transfer_count: runtime.fallback_transfer_count,
+        seeding_peer_count: runtime.seeding_peer_count,
         metadata_revision: runtime.metadata_revision,
         last_activity_unix_ms: runtime.last_activity_unix_ms,
     }
@@ -1216,7 +1840,9 @@ fn build_metrics(runtime: &ShareRuntime) -> ShareMetrics {
 
 fn build_insights(runtime: &ShareRuntime) -> ShareInsights {
     let is_sharing = runtime.session.is_some();
-    let active_downloads = build_metrics(runtime).active_client_count;
+    let metrics = build_metrics(runtime);
+    let active_downloads = metrics.active_client_count;
+    let seeding_peers = metrics.seeding_peer_count;
     let reachability = if is_sharing {
         "LAN 可連線".to_string()
     } else {
@@ -1242,6 +1868,7 @@ fn build_insights(runtime: &ShareRuntime) -> ShareInsights {
         share_state,
         reachability,
         active_downloads,
+        seeding_peers,
         recent_error: runtime.last_error.clone(),
         recent_activity_label: format_recent_activity(runtime.last_activity_unix_ms),
         next_action_hint,
@@ -1274,32 +1901,102 @@ struct SeedMetadata {
     piece_size: usize,
     piece_count: usize,
     magnet_uri: String,
+    content_signature: String,
+    seed_reused: bool,
+    torrent_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SeedDescriptor {
+    schema_version: u16,
+    file_size: u64,
+    modified_unix_ms: u128,
+    piece_size: usize,
+    piece_count: usize,
+    info_hash: String,
+    pieces_base64: String,
 }
 
 async fn build_seed_metadata(
     path: &Path,
     trackers: &[String],
+    web_seed_url: &str,
     progress_callback: impl Fn(u64) -> Result<(), String> + Send,
 ) -> Result<SeedMetadata, String> {
-    let file_size = fs::metadata(path)
+    let file_meta = fs::metadata(path)
         .await
-        .map_err(|e| format!("Failed to stat file: {e}"))?
-        .len();
+        .map_err(|e| format!("Failed to stat file: {e}"))?;
+    let file_size = file_meta.len();
+    let modified_unix_ms = file_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
 
     let piece_size = DEFAULT_PIECE_SIZE;
-    let piece_count = if file_size == 0 {
+    let expected_piece_count = if file_size == 0 {
         1
     } else {
         (file_size as usize).div_ceil(piece_size)
     };
 
+    let display_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("shared-file");
+
+    if let Some(reused) = load_seed_descriptor(path).await {
+        if reused.schema_version == METADATA_VERSION
+            && reused.file_size == file_size
+            && reused.modified_unix_ms == modified_unix_ms
+            && reused.piece_size == piece_size
+            && reused.piece_count == expected_piece_count
+            && !reused.info_hash.is_empty()
+            && !reused.pieces_base64.is_empty()
+        {
+            progress_callback(file_size)?;
+
+            let piece_hashes = base64::engine::general_purpose::STANDARD
+                .decode(reused.pieces_base64.as_bytes())
+                .map_err(|e| format!("Failed to decode seed descriptor pieces: {e}"))?;
+            let (torrent_bytes, info_hash) = build_torrent_bytes(
+                display_name,
+                file_size,
+                piece_size,
+                &piece_hashes,
+                trackers,
+                web_seed_url,
+            );
+            let magnet_uri =
+                build_magnet_uri(&info_hash, display_name, file_size, trackers, web_seed_url);
+
+            return Ok(SeedMetadata {
+                file_size,
+                info_hash,
+                piece_size,
+                piece_count: reused.piece_count,
+                magnet_uri,
+                content_signature: format!(
+                    "{}:{}:{}",
+                    reused.info_hash, reused.file_size, reused.piece_count
+                ),
+                seed_reused: true,
+                torrent_bytes,
+            });
+        }
+    }
+
+    let piece_count = expected_piece_count;
+
     let mut file = fs::File::open(path)
         .await
         .map_err(|e| format!("Failed to open file: {e}"))?;
 
-    let mut hasher = Sha1::new();
-    let mut buffer = vec![0; CHUNK_SIZE];
+    let mut buffer = vec![0; piece_size.max(1)];
     let mut bytes_processed = 0u64;
+    let mut piece_hashes = Vec::with_capacity(piece_count * 20);
 
     loop {
         let n = file
@@ -1310,19 +2007,35 @@ async fn build_seed_metadata(
             break;
         }
 
-        hasher.update(&buffer[..n]);
+        let mut piece_hasher = Sha1::new();
+        piece_hasher.update(&buffer[..n]);
+        piece_hashes.extend_from_slice(&piece_hasher.finalize());
         bytes_processed += n as u64;
         progress_callback(bytes_processed)?;
     }
 
-    let info_hash = hex::encode(hasher.finalize());
+    let (torrent_bytes, info_hash) = build_torrent_bytes(
+        display_name,
+        file_size,
+        piece_size,
+        &piece_hashes,
+        trackers,
+        web_seed_url,
+    );
+    let magnet_uri = build_magnet_uri(&info_hash, display_name, file_size, trackers, web_seed_url);
 
-    let display_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("shared-file");
+    let descriptor = SeedDescriptor {
+        schema_version: METADATA_VERSION,
+        file_size,
+        modified_unix_ms,
+        piece_size,
+        piece_count,
+        info_hash: info_hash.clone(),
+        pieces_base64: base64::engine::general_purpose::STANDARD.encode(piece_hashes),
+    };
+    save_seed_descriptor(path, &descriptor).await;
 
-    let magnet_uri = build_magnet_uri(&info_hash, display_name, file_size, trackers);
+    let content_signature = format!("{}:{}:{}", info_hash, file_size, piece_count);
 
     Ok(SeedMetadata {
         file_size,
@@ -1330,7 +2043,98 @@ async fn build_seed_metadata(
         piece_size,
         piece_count,
         magnet_uri,
+        content_signature,
+        seed_reused: false,
+        torrent_bytes,
     })
+}
+
+fn seed_descriptor_path(path: &Path) -> Option<PathBuf> {
+    let file_name = path.file_name()?.to_str()?;
+    Some(path.with_file_name(format!("{file_name}.mesh.seed.json")))
+}
+
+async fn load_seed_descriptor(path: &Path) -> Option<SeedDescriptor> {
+    let descriptor_path = seed_descriptor_path(path)?;
+    let raw = fs::read_to_string(descriptor_path).await.ok()?;
+    serde_json::from_str::<SeedDescriptor>(&raw).ok()
+}
+
+async fn save_seed_descriptor(path: &Path, descriptor: &SeedDescriptor) {
+    if let Some(descriptor_path) = seed_descriptor_path(path) {
+        if let Ok(raw) = serde_json::to_string_pretty(descriptor) {
+            let _ = fs::write(descriptor_path, raw).await;
+        }
+    }
+}
+
+fn build_torrent_bytes(
+    display_name: &str,
+    file_size: u64,
+    piece_size: usize,
+    piece_hashes: &[u8],
+    trackers: &[String],
+    web_seed_url: &str,
+) -> (Vec<u8>, String) {
+    let info_bytes = bencode_dict(vec![
+        ("length", bencode_int(file_size as i64)),
+        ("name", bencode_bytes(display_name.as_bytes())),
+        ("piece length", bencode_int(piece_size as i64)),
+        ("pieces", bencode_bytes(piece_hashes)),
+    ]);
+    let info_hash = hex::encode(Sha1::digest(&info_bytes));
+
+    let mut root_entries = Vec::new();
+    if let Some(primary_tracker) = trackers.first() {
+        root_entries.push(("announce", bencode_bytes(primary_tracker.as_bytes())));
+    }
+    if !trackers.is_empty() {
+        let announce_list = trackers
+            .iter()
+            .map(|tracker| bencode_list(vec![bencode_bytes(tracker.as_bytes())]))
+            .collect::<Vec<_>>();
+        root_entries.push(("announce-list", bencode_list(announce_list)));
+    }
+    root_entries.push(("created by", bencode_bytes(b"mesh-p2p")));
+    root_entries.push(("creation date", bencode_int((unix_time_ms() / 1000) as i64)));
+    root_entries.push(("info", info_bytes));
+    root_entries.push((
+        "url-list",
+        bencode_list(vec![bencode_bytes(web_seed_url.as_bytes())]),
+    ));
+
+    (bencode_dict(root_entries), info_hash)
+}
+
+fn bencode_int(value: i64) -> Vec<u8> {
+    format!("i{value}e").into_bytes()
+}
+
+fn bencode_bytes(value: &[u8]) -> Vec<u8> {
+    let mut encoded = format!("{}:", value.len()).into_bytes();
+    encoded.extend_from_slice(value);
+    encoded
+}
+
+fn bencode_list(items: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut encoded = vec![b'l'];
+    for item in items {
+        encoded.extend_from_slice(&item);
+    }
+    encoded.push(b'e');
+    encoded
+}
+
+fn bencode_dict(mut entries: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut encoded = vec![b'd'];
+    for (key, value) in entries {
+        encoded.extend_from_slice(format!("{}:{key}", key.len()).as_bytes());
+        encoded.extend_from_slice(&value);
+    }
+    encoded.push(b'e');
+    encoded
 }
 
 fn load_trackers_from_env() -> Vec<String> {
@@ -1362,6 +2166,7 @@ fn build_magnet_uri(
     file_name: &str,
     file_size: u64,
     trackers: &[String],
+    web_seed_url: &str,
 ) -> String {
     let mut uri = format!(
         "magnet:?xt=urn:btih:{}&dn={}&xl={}",
@@ -1374,6 +2179,9 @@ fn build_magnet_uri(
         uri.push_str("&tr=");
         uri.push_str(&urlencoding::encode(tr));
     }
+
+    uri.push_str("&ws=");
+    uri.push_str(&urlencoding::encode(web_seed_url));
 
     uri
 }
@@ -1436,8 +2244,43 @@ impl Drop for ShareRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_seed_metadata, parse_trackers};
+    use super::{
+        build_seed_metadata, client_stats_handler, file_handler, metadata_handler, parse_trackers,
+        rebuild_reported_metrics, seed_descriptor_path, torrent_handler, ClientReportSnapshot,
+        ClientStatsReport, HttpState, MetadataQuery, ShareRuntime,
+    };
+    use axum::{
+        extract::ConnectInfo, extract::Query, extract::State as AxumState, response::IntoResponse,
+        Json,
+    };
+    use std::collections::{HashMap, VecDeque};
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn test_http_state() -> HttpState {
+        HttpState {
+            runtime: Arc::new(Mutex::new(ShareRuntime {
+                server: None,
+                session: None,
+                tracker_urls: vec![],
+                fallback_http_enabled: false,
+                http_uploaded_bytes: 0,
+                p2p_uploaded_bytes: 0,
+                active_p2p_peer_count: 0,
+                fallback_transfer_count: 0,
+                seeding_peer_count: 0,
+                metadata_revision: 0,
+                last_activity_unix_ms: 0,
+                client_activity: VecDeque::new(),
+                client_reports: HashMap::new(),
+                last_error: None,
+                processing_progress: None,
+                processing_cancel_requested: false,
+            })),
+            limiter: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
 
     #[tokio::test]
     async fn build_seed_metadata_for_valid_file() {
@@ -1445,23 +2288,66 @@ mod tests {
         tmp.write_all(b"mesh-p2p-test").expect("write temp");
 
         let trackers = vec!["wss://tracker.example.com".to_string()];
-        let metadata = build_seed_metadata(tmp.path(), &trackers, |_| Ok(()))
-            .await
-            .expect("metadata should be generated");
+        let metadata = build_seed_metadata(
+            tmp.path(),
+            &trackers,
+            "http://127.0.0.1:3000/api/file/file-1",
+            |_| Ok(()),
+        )
+        .await
+        .expect("metadata should be generated");
 
         assert!(metadata.file_size > 0);
         assert!(!metadata.info_hash.is_empty());
         assert!(metadata.magnet_uri.contains("magnet:?xt=urn:btih:"));
         assert!(metadata.magnet_uri.contains("tracker.example.com"));
+        assert!(!metadata.content_signature.is_empty());
     }
 
     #[tokio::test]
     async fn build_seed_metadata_for_invalid_file_fails() {
         let trackers = vec!["wss://tracker.example.com".to_string()];
-        let result =
-            build_seed_metadata(std::path::Path::new("/no/such/file"), &trackers, |_| Ok(())).await;
+        let result = build_seed_metadata(
+            std::path::Path::new("/no/such/file"),
+            &trackers,
+            "http://127.0.0.1:3000/api/file/file-1",
+            |_| Ok(()),
+        )
+        .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn build_seed_metadata_reuses_descriptor_when_file_unchanged() {
+        let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
+        tmp.write_all(b"mesh-p2p-test").expect("write temp");
+
+        let trackers = vec!["wss://tracker.example.com".to_string()];
+        let first = build_seed_metadata(
+            tmp.path(),
+            &trackers,
+            "http://127.0.0.1:3000/api/file/file-1",
+            |_| Ok(()),
+        )
+        .await
+        .expect("first metadata");
+        assert!(!first.seed_reused);
+
+        let second = build_seed_metadata(
+            tmp.path(),
+            &trackers,
+            "http://127.0.0.1:3000/api/file/file-1",
+            |_| Ok(()),
+        )
+        .await
+        .expect("second metadata");
+
+        assert!(second.seed_reused);
+        assert_eq!(first.info_hash, second.info_hash);
+
+        let descriptor_path = seed_descriptor_path(tmp.path()).expect("descriptor path");
+        assert!(descriptor_path.exists());
     }
 
     #[test]
@@ -1472,5 +2358,104 @@ mod tests {
         assert!(trackers.iter().any(|s| s == "wss://ok"));
         assert!(trackers.iter().any(|s| s == "udp://ok2"));
         assert!(trackers.iter().any(|s| s == "https://ok3"));
+    }
+
+    #[test]
+    fn rebuild_reported_metrics_aggregates_p2p_and_peer_counts() {
+        let now = Instant::now();
+        let mut runtime = ShareRuntime {
+            server: None,
+            session: None,
+            tracker_urls: vec![],
+            fallback_http_enabled: false,
+            http_uploaded_bytes: 0,
+            p2p_uploaded_bytes: 0,
+            active_p2p_peer_count: 0,
+            fallback_transfer_count: 0,
+            seeding_peer_count: 0,
+            metadata_revision: 0,
+            last_activity_unix_ms: 0,
+            client_activity: VecDeque::new(),
+            client_reports: HashMap::from([
+                (
+                    "a".to_string(),
+                    ClientReportSnapshot {
+                        p2p_uploaded_bytes: 128,
+                        active_peers: 2,
+                        is_seeding: true,
+                        last_seen: now,
+                    },
+                ),
+                (
+                    "b".to_string(),
+                    ClientReportSnapshot {
+                        p2p_uploaded_bytes: 256,
+                        active_peers: 3,
+                        is_seeding: false,
+                        last_seen: now - Duration::from_secs(1),
+                    },
+                ),
+            ]),
+            last_error: None,
+            processing_progress: None,
+            processing_cancel_requested: false,
+        };
+
+        rebuild_reported_metrics(&mut runtime, now);
+
+        assert_eq!(runtime.p2p_uploaded_bytes, 384);
+        assert_eq!(runtime.active_p2p_peer_count, 5);
+        assert_eq!(runtime.seeding_peer_count, 1);
+    }
+
+    #[tokio::test]
+    async fn inactive_session_routes_return_gone() {
+        let state = test_http_state();
+        let addr = "127.0.0.1:45678".parse().expect("socket addr");
+
+        let metadata_response = metadata_handler(
+            Query(MetadataQuery {
+                metadata_version: Some(1),
+            }),
+            ConnectInfo(addr),
+            AxumState(state.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(metadata_response.status(), axum::http::StatusCode::GONE);
+
+        let file_response = file_handler(
+            axum::http::HeaderMap::new(),
+            axum::extract::Path("file-1".to_string()),
+            ConnectInfo(addr),
+            AxumState(state.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(file_response.status(), axum::http::StatusCode::GONE);
+
+        let torrent_response = torrent_handler(
+            axum::extract::Path("file-1".to_string()),
+            ConnectInfo(addr),
+            AxumState(state.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(torrent_response.status(), axum::http::StatusCode::GONE);
+
+        let client_stats_response = client_stats_handler(
+            ConnectInfo(addr),
+            AxumState(state),
+            Json(ClientStatsReport {
+                client_id: "client-a".to_string(),
+                file_id: "file-1".to_string(),
+                p2p_uploaded_bytes: 64,
+                active_peers: 1,
+                is_seeding: true,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(client_stats_response.status(), axum::http::StatusCode::GONE);
     }
 }

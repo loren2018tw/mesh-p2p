@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "replay:webtorrent": "node ./scripts/replay-webtorrent-lifecycle.mjs"
   },
   "dependencies": {
     "@mdi/font": "^7.4.47",
@@ -23,11 +24,16 @@
     "@vitejs/plugin-vue": "^5.2.1",
     "typescript": "~5.6.2",
     "vite": "^6.0.3",
-    "vue-tsc": "^2.1.10"
+    "vue-tsc": "^2.1.10",
+    "webtorrent": "^2.8.5"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
-      "esbuild"
+      "bufferutil",
+      "esbuild",
+      "node-datachannel",
+      "utf-8-validate",
+      "utp-native"
     ]
   }
 }

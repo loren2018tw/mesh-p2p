@@ -15,6 +15,8 @@ type SharedFile = {
   pieceSize: number;
   pieceCount: number;
   magnetUri: string;
+  contentSignature: string;
+  seedReused: boolean;
 };
 
 type ShareSession = {
@@ -31,6 +33,10 @@ type ShareSession = {
 type ShareMetrics = {
   activeClientCount: number;
   httpUploadedBytes: number;
+  p2pUploadedBytes: number;
+  activeP2pPeerCount: number;
+  fallbackTransferCount: number;
+  seedingPeerCount: number;
   metadataRevision: number;
   lastActivityUnixMs: number;
 };
@@ -39,6 +45,7 @@ type ShareInsights = {
   shareState: string;
   reachability: string;
   activeDownloads: number;
+  seedingPeers: number;
   recentError: string | null;
   recentActivityLabel: string;
   nextActionHint: string;
@@ -86,6 +93,10 @@ const metrics = computed(
     shareStatus.value?.metrics ?? {
       activeClientCount: 0,
       httpUploadedBytes: 0,
+      p2pUploadedBytes: 0,
+      activeP2pPeerCount: 0,
+      fallbackTransferCount: 0,
+      seedingPeerCount: 0,
       metadataRevision: 0,
       lastActivityUnixMs: 0,
     },
@@ -97,6 +108,7 @@ const insights = computed(
       shareState: "未啟動",
       reachability: "尚未啟動",
       activeDownloads: 0,
+      seedingPeers: 0,
       recentError: null,
       recentActivityLabel: "暫無活動",
       nextActionHint: "先選擇檔案並啟動分享",
@@ -387,6 +399,10 @@ onUnmounted(() => {
                     :label="`活躍下載：${insights.activeDownloads}`"
                     kind="warning"
                   />
+                  <UiStatusChip
+                    :label="`協同分享：${insights.seedingPeers}`"
+                    kind="success"
+                  />
                 </div>
 
                 <v-row>
@@ -612,12 +628,16 @@ onUnmounted(() => {
                       { title: '檔名', value: 'fileName' },
                       { title: '大小', value: 'fileSize' },
                       { title: 'Piece', value: 'pieceCount' },
+                      { title: '重用', value: 'seedReused' },
                     ]"
                     :items-per-page="5"
                     density="comfortable"
                   >
                     <template #item.fileSize="{ item }">
                       {{ formatBytes(item.fileSize) }}
+                    </template>
+                    <template #item.seedReused="{ item }">
+                      {{ item.seedReused ? "已重用" : "新建" }}
                     </template>
                   </v-data-table>
                 </v-card>
@@ -646,6 +666,11 @@ onUnmounted(() => {
                   prepend-icon="mdi-download-network"
                 />
                 <v-list-item
+                  title="協同分享端"
+                  :subtitle="`${insights.seedingPeers} 個`"
+                  prepend-icon="mdi-upload-network"
+                />
+                <v-list-item
                   title="最近活動"
                   :subtitle="insights.recentActivityLabel"
                   prepend-icon="mdi-timeline-clock"
@@ -666,6 +691,21 @@ onUnmounted(() => {
                 <div class="text-body-2 mb-1">
                   累計 HTTP 上傳：<strong>{{
                     formatBytes(metrics.httpUploadedBytes)
+                  }}</strong>
+                </div>
+                <div class="text-body-2 mb-1">
+                  累計 P2P 上傳：<strong>{{
+                    formatBytes(metrics.p2pUploadedBytes)
+                  }}</strong>
+                </div>
+                <div class="text-body-2 mb-1">
+                  目前 P2P peers：<strong>{{
+                    metrics.activeP2pPeerCount
+                  }}</strong>
+                </div>
+                <div class="text-body-2 mb-1">
+                  HTTP fallback 次數：<strong>{{
+                    metrics.fallbackTransferCount
                   }}</strong>
                 </div>
                 <div class="text-body-2 mb-1">
