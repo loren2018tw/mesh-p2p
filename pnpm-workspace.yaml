@@ -1,6 +1,6 @@
 allowBuilds:
-  '0': bufferutil
-  '1': esbuild
-  '2': node-datachannel
-  '3': utf-8-validate
-  '4': utp-native
+  bufferutil: true
+  esbuild: true
+  node-datachannel: true
+  utf-8-validate: true
+  utp-native: true
