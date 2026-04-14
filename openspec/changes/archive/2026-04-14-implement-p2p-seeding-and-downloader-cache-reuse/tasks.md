@@ -27,6 +27,6 @@
 
 ## 5. 驗證與發佈前檢查
 
-- [ ] 5.1 進行多裝置 LAN 測試，驗證分享連結、metadata 初始化、P2P 交換與 HTTP fallback。
+- [x] 5.1 進行多裝置 LAN 測試，驗證分享連結、metadata 初始化、P2P 交換與 HTTP fallback。
 - [x] 5.2 驗證停止分享後行為：metadata API 回應 session 失效、新下載初始化被拒絕、既有 seeding 被回收。
 - [x] 5.3 更新 README 或操作文件，補充種子重用與下載端協同分享的行為說明與限制。
