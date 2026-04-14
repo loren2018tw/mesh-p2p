@@ -26,14 +26,5 @@
     "vite": "^6.0.3",
     "vue-tsc": "^2.1.10",
     "webtorrent": "^2.8.5"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "bufferutil",
-      "esbuild",
-      "node-datachannel",
-      "utf-8-validate",
-      "utp-native"
-    ]
   }
 }
