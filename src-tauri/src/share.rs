@@ -21,7 +21,11 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tauri::{State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
-use tokio::{fs, io::AsyncReadExt, sync::oneshot};
+use tokio::{
+    fs,
+    io::AsyncReadExt,
+    sync::{oneshot, Semaphore},
+};
 
 const DEFAULT_PIECE_SIZE: usize = 256 * 1024;
 const RATE_LIMIT_WINDOW_MS: u64 = 1000;
@@ -31,6 +35,8 @@ const METADATA_VERSION: u16 = 1;
 const MIN_SUPPORTED_METADATA_VERSION: u16 = 1;
 const MAX_SUPPORTED_METADATA_VERSION: u16 = METADATA_VERSION;
 const APP_VERSION_PLACEHOLDER: &str = "__APP_VERSION__";
+const MAX_CHUNK_SIZE: usize = 50 * 1024 * 1024; // 改為 50 MB (原 200 MB)
+const MAX_CONCURRENT_RANGES: usize = 100; // 最多 100 並行 range requests
 
 static APP_VERSION: OnceLock<String> = OnceLock::new();
 
@@ -155,6 +161,7 @@ struct ServerRuntime {
 struct HttpState {
     runtime: Arc<Mutex<ShareRuntime>>,
     limiter: Arc<Mutex<VecDeque<Instant>>>,
+    range_semaphore: Arc<Semaphore>, // 限制並行 range requests
 }
 
 #[derive(Debug)]
@@ -592,6 +599,7 @@ async fn ensure_server_running(runtime: Arc<Mutex<ShareRuntime>>) -> Result<Stri
     let http_state = HttpState {
         runtime: runtime.clone(),
         limiter: Arc::new(Mutex::new(VecDeque::new())),
+        range_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RANGES)),
     };
 
     let router = Router::new()
@@ -1048,6 +1056,13 @@ async fn download_page_handler() -> impl IntoResponse {
                             const torrentBytes = await fetchTorrentBytes(file.fileId);
 
                             const torrent = client.add(torrentBytes, { destroyStoreOnDestroy: false });
+                            
+                            // 限制並行 peer 連線數 (改進 1)
+                            const MAX_CONCURRENT_PEERS = 15;
+                            if (typeof torrent.setMaxConns === 'function') {
+                                torrent.setMaxConns(MAX_CONCURRENT_PEERS);
+                            }
+                            
                             // error handler 必須最先附上，避免 EventEmitter 在 handler 尚未
                             // 附上前發出 'error' 事件而變成 Uncaught 錯誤。
                             torrent.on('error', (error) => {
@@ -1407,7 +1422,10 @@ async fn file_handler(
     let mut end = file_size.saturating_sub(1);
     let mut is_partial = false;
 
-    if let Some(range_value) = headers.get(axum::http::header::RANGE).and_then(|h| h.to_str().ok()) {
+    if let Some(range_value) = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|h| h.to_str().ok())
+    {
         if range_value.starts_with("bytes=") {
             let parts: Vec<&str> = range_value["bytes=".len()..].split('-').collect();
             if !parts.is_empty() {
@@ -1426,7 +1444,10 @@ async fn file_handler(
 
     if start >= file_size && file_size > 0 {
         let mut res_headers = axum::http::HeaderMap::new();
-        res_headers.insert(axum::http::header::CONTENT_RANGE, format!("bytes */{file_size}").parse().unwrap());
+        res_headers.insert(
+            axum::http::header::CONTENT_RANGE,
+            format!("bytes */{file_size}").parse().unwrap(),
+        );
         return (StatusCode::RANGE_NOT_SATISFIABLE, res_headers, "").into_response();
     }
     if end >= file_size {
@@ -1437,9 +1458,29 @@ async fn file_handler(
     }
 
     let chunk_size = (end - start + 1) as usize;
-    if chunk_size > 200 * 1024 * 1024 {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "Chunk too large, please use Range requests").into_response();
+    if chunk_size > MAX_CHUNK_SIZE {
+        let max_mb = MAX_CHUNK_SIZE / 1024 / 1024;
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Chunk too large (max {} MB), please use smaller Range requests",
+                max_mb
+            ),
+        )
+            .into_response();
     }
+
+    // 取得 range request 信號量許可證
+    let _permit = match state.range_semaphore.acquire().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many concurrent downloads, please retry",
+            )
+                .into_response()
+        }
+    };
 
     use std::io::SeekFrom;
     use tokio::io::AsyncSeekExt;
@@ -1448,7 +1489,10 @@ async fn file_handler(
     }
 
     let mut buffer = vec![0; chunk_size];
-    if tokio::io::AsyncReadExt::read_exact(&mut file, &mut buffer).await.is_err() {
+    if tokio::io::AsyncReadExt::read_exact(&mut file, &mut buffer)
+        .await
+        .is_err()
+    {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -1466,15 +1510,23 @@ async fn file_handler(
 
     let mut res_headers = axum::http::HeaderMap::new();
     res_headers.insert(axum::http::header::ACCEPT_RANGES, "bytes".parse().unwrap());
-    res_headers.insert(axum::http::header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+    res_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        "application/octet-stream".parse().unwrap(),
+    );
 
     if is_partial {
-        res_headers.insert(axum::http::header::CONTENT_RANGE, format!("bytes {start}-{end}/{file_size}").parse().unwrap());
+        res_headers.insert(
+            axum::http::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{file_size}").parse().unwrap(),
+        );
         (StatusCode::PARTIAL_CONTENT, res_headers, buffer).into_response()
     } else {
         res_headers.insert(
             axum::http::header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{file_name}\"").parse().unwrap(),
+            format!("attachment; filename=\"{file_name}\"")
+                .parse()
+                .unwrap(),
         );
         (StatusCode::OK, res_headers, buffer).into_response()
     }
@@ -2247,7 +2299,7 @@ mod tests {
     use super::{
         build_seed_metadata, client_stats_handler, file_handler, metadata_handler, parse_trackers,
         rebuild_reported_metrics, seed_descriptor_path, torrent_handler, ClientReportSnapshot,
-        ClientStatsReport, HttpState, MetadataQuery, ShareRuntime,
+        ClientStatsReport, HttpState, MetadataQuery, ShareRuntime, MAX_CONCURRENT_RANGES,
     };
     use axum::{
         extract::ConnectInfo, extract::Query, extract::State as AxumState, response::IntoResponse,
@@ -2257,6 +2309,7 @@ mod tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+    use tokio::sync::Semaphore;
 
     fn test_http_state() -> HttpState {
         HttpState {
@@ -2279,6 +2332,7 @@ mod tests {
                 processing_cancel_requested: false,
             })),
             limiter: Arc::new(Mutex::new(VecDeque::new())),
+            range_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RANGES)),
         }
     }
 
