@@ -802,30 +802,32 @@ async fn download_page_handler() -> impl IntoResponse {
 
             const SUPPORTED_METADATA_VERSION = 1;
             const CLIENT_ID = `dl-${Math.random().toString(36).slice(2)}-${Date.now()}`;
-            const MAX_BLOB_SAVE_BYTES = 1024 * 1024 * 1024; // 1GB: avoid browser blob allocation failure
 
-            // IdbChunkStore: 使用 IndexedDB 存放 WebTorrent pieces，避免大檔案佔滿 JS heap。
-            class IdbChunkStore {
+            // FileSystemChunkStore: 透過 File System Access API 直接讀寫檔案系統，
+            // 取代 IdbChunkStore，下載完成即存在磁碟上，無須手動儲存。
+            class FileSystemChunkStore {
                 constructor(chunkLength, opts) {
                     this.chunkLength = chunkLength;
                     this.length = opts.length || 0;
-                    this.name = `wt-${opts.name || 'store'}`;
-                    this._ready = new Promise((resolve, reject) => {
-                        const req = indexedDB.open(this.name, 1);
-                        req.onupgradeneeded = (e) => e.target.result.createObjectStore('c');
-                        req.onsuccess = (e) => resolve(e.target.result);
-                        req.onerror = (e) => reject(e.target.error);
-                    });
+                    this.fileHandle = opts.fileHandle;
+                    this.dirHandle = opts.dirHandle;
+                    this.fileName = opts.fileName;
+                    this._writeQueue = Promise.resolve();
                 }
 
                 put(index, buf, cb) {
-                    this._ready
-                        .then((db) => {
-                            const tx = db.transaction('c', 'readwrite');
-                            tx.objectStore('c').put(buf, index).onsuccess = () => cb(null);
-                            tx.onerror = (e) => cb(e.target.error);
-                        })
-                        .catch(cb);
+                    this._writeQueue = this._writeQueue.then(async () => {
+                        try {
+                            const writable = await this.fileHandle.createWritable({ keepExistingData: true });
+                            const offset = index * this.chunkLength;
+                            await writable.seek(offset);
+                            await writable.write(buf);
+                            await writable.close();
+                            cb(null);
+                        } catch (err) {
+                            cb(err);
+                        }
+                    });
                 }
 
                 get(index, opts, cb) {
@@ -835,25 +837,16 @@ async fn download_page_handler() -> impl IntoResponse {
                     }
                     const offset = (opts && opts.offset) || 0;
                     const len = opts && opts.length != null ? opts.length : null;
-                    this._ready
-                        .then((db) => {
-                            const req = db.transaction('c', 'readonly').objectStore('c').get(index);
-                            req.onsuccess = (e) => {
-                                let chunk = e.target.result;
-                                if (!chunk) {
-                                    return cb(null, new Uint8Array(len != null ? len : this.chunkLength));
-                                }
-                                if (offset !== 0 || len != null) {
-                                    chunk = chunk.slice(
-                                        offset,
-                                        offset + (len != null ? len : chunk.length - offset)
-                                    );
-                                }
-                                cb(null, chunk);
-                            };
-                            req.onerror = (e) => cb(e.target.error);
-                        })
-                        .catch(cb);
+                    const byteOffset = index * this.chunkLength + offset;
+                    const byteLength = len != null ? len : this.chunkLength;
+                    this.fileHandle.getFile().then((file) => {
+                        const slice = file.slice(byteOffset, byteOffset + byteLength);
+                        return slice.arrayBuffer();
+                    }).then((ab) => {
+                        cb(null, new Uint8Array(ab));
+                    }).catch((err) => {
+                        cb(err);
+                    });
                 }
 
                 close(cb) {
@@ -861,20 +854,15 @@ async fn download_page_handler() -> impl IntoResponse {
                 }
 
                 destroy(cb) {
-                    this._ready
-                        .then((db) => {
-                            db.close();
-                            const req = indexedDB.deleteDatabase(this.name);
-                            req.onsuccess = () => {
-                                if (cb) cb(null);
-                            };
-                            req.onerror = (e) => {
-                                if (cb) cb(e.target.error);
-                            };
-                        })
-                        .catch((err) => {
+                    if (this.dirHandle && this.fileName) {
+                        this.dirHandle.removeEntry(this.fileName).then(() => {
+                            if (cb) cb(null);
+                        }).catch((err) => {
                             if (cb) cb(err);
                         });
+                    } else {
+                        if (cb) cb(null);
+                    }
                 }
             }
 
@@ -887,8 +875,10 @@ async fn download_page_handler() -> impl IntoResponse {
                     const lastRevision = ref(-1);
                     const timerId = ref(null);
                     const downloads = ref({});
-                    const saveBusy = ref({});
-                    const saveDirHandle = ref(null);
+                    const browserSupported = ref(true);
+                    const directoryReady = ref(false);
+                    const dirHandle = ref(null);
+                    const dirName = ref('');
                     let torrentClient = null;
                     const torrentSessions = {};
 
@@ -966,50 +956,33 @@ async fn download_page_handler() -> impl IntoResponse {
                         });
                     }
 
-                    async function hasDirectoryWritePermission(handle) {
-                        if (!handle) return false;
+                    async function activateDirectory(handle) {
                         const opts = { mode: 'readwrite' };
                         const queried = await handle.queryPermission(opts);
-                        if (queried === 'granted') return true;
-                        const requested = await handle.requestPermission(opts);
-                        return requested === 'granted';
+                        if (queried !== 'granted') {
+                            const requested = await handle.requestPermission(opts);
+                            if (requested !== 'granted') return false;
+                        }
+                        dirHandle.value = handle;
+                        dirName.value = handle.name || '已選擇';
+                        directoryReady.value = true;
+                        return true;
                     }
 
-                    async function ensureSaveDirectoryReady() {
-                        if (!window.showDirectoryPicker) {
-                            return null;
-                        }
-
-                        if (!saveDirHandle.value) {
-                            saveDirHandle.value = await loadSavedDirectoryHandle();
-                        }
-
-                        if (await hasDirectoryWritePermission(saveDirHandle.value)) {
-                            return saveDirHandle.value;
-                        }
-
-                        let picked;
+                    async function pickDirectory() {
                         try {
-                            picked = await window.showDirectoryPicker({ mode: 'readwrite' });
-                        } catch (err) {
-                            if (err.name === 'AbortError') {
-                                return null;
+                            const picked = await window.showDirectoryPicker({ mode: 'readwrite' });
+                            const ok = await activateDirectory(picked);
+                            if (!ok) {
+                                warningText.value = '未取得目錄寫入權限。';
+                                return;
                             }
-                            throw err;
+                            try { await persistDirectoryHandle(picked); } catch (_) {}
+                        } catch (err) {
+                            if (err.name !== 'AbortError') {
+                                warningText.value = String(err);
+                            }
                         }
-
-                        const granted = await hasDirectoryWritePermission(picked);
-                        if (!granted) {
-                            throw new Error('未取得目錄寫入權限，無法開始下載。');
-                        }
-
-                        saveDirHandle.value = picked;
-                        try {
-                            await persistDirectoryHandle(picked);
-                        } catch (_) {
-                            // 忽略持久化失敗：至少本次執行仍可使用已授權目錄。
-                        }
-                        return picked;
                     }
 
                     async function reportClientStats(file, torrent, isSeeding) {
@@ -1141,7 +1114,6 @@ async fn download_page_handler() -> impl IntoResponse {
                         state.progressPercent = state.totalBytes > 0
                             ? Math.min(100, Math.round((state.bytesReceived / state.totalBytes) * 100))
                             : 0;
-                        // Prefer measured byte delta; blend with WebTorrent internal speed to reduce jitter.
                         const blended = measuredSpeed > 0
                             ? Math.round((measuredSpeed * 0.7) + (reportedSpeed * 0.3))
                             : reportedSpeed;
@@ -1158,187 +1130,14 @@ async fn download_page_handler() -> impl IntoResponse {
                         void reportClientStats(file, torrent, state.phase === 'seeding' || torrent.progress === 1);
                     }
 
-                    function persistTorrentFile(file, torrent) {
-                        return new Promise((resolve, reject) => {
-                            const target = torrent.files?.find((entry) => entry.name === file.fileName) || torrent.files?.[0];
-                            if (!target) {
-                                reject(new Error('torrent 內容為空'));
-                                return;
-                            }
-                            
-                            if (typeof target.blob === 'function') {
-                                target.blob().then(blob => {
-                                    saveBlob(file.fileName, blob);
-                                    resolve();
-                                }).catch(reject);
-                            } else if (typeof target.getBlob === 'function') {
-                                target.getBlob((error, blob) => {
-                                    if (error) {
-                                        reject(error);
-                                        return;
-                                    }
-                                    saveBlob(file.fileName, blob);
-                                    resolve();
-                                });
-                            } else if (typeof target.getBlobURL === 'function') {
-                                target.getBlobURL((error, url) => {
-                                    if (error) {
-                                        reject(error);
-                                    } else {
-                                        const link = document.createElement('a');
-                                        link.href = url;
-                                        link.download = file.fileName;
-                                        document.body.appendChild(link);
-                                        link.click();
-                                        link.remove();
-                                        resolve();
-                                    }
-                                });
-                            } else {
-                                reject(new Error('無法獲取下載檔案 (WebTorrent API 不支援)'));
-                            }
-                        });
-                    }
-
-                    function saveBlob(fileName, blob) {
-                        const url = URL.createObjectURL(blob);
-                        const link = document.createElement('a');
-                        link.href = url;
-                        link.download = fileName;
-                        document.body.appendChild(link);
-                        link.click();
-                        link.remove();
-                        URL.revokeObjectURL(url);
-                    }
-
-                    // 從 IndexedDB 串流直接寫入已授權目錄或單檔授權，不走 HTTP、不在記憶體組裝整個 Blob。
-                    async function saveFromIdbStore(file, torrent) {
-                        const wtFile =
-                            torrent.files.find((f) => f.name === file.fileName) ||
-                            torrent.files[0];
-                        if (!wtFile) throw new Error('找不到對應的 torrent 檔案物件');
-
-                        let fileHandle;
-
-                        if (window.showDirectoryPicker) {
-                            const dirHandle = await ensureSaveDirectoryReady();
-                            if (dirHandle) {
-                                fileHandle = await dirHandle.getFileHandle(file.fileName, { create: true });
-                            }
-                        }
-
-                        if (!fileHandle) {
-                            if (window.showSaveFilePicker) {
-                                try {
-                                    fileHandle = await window.showSaveFilePicker({ suggestedName: file.fileName });
-                                } catch (err) {
-                                    if (err.name === 'AbortError') return false;
-                                    throw err;
-                                }
-                            } else {
-                                throw new Error('目錄與單檔授權 API 皆不支援 (File System Access API 缺失)');
-                            }
-                        }
-
-                        const writable = await fileHandle.createWritable();
-                        const totalBytes = wtFile.length || file.fileSize || 0;
-                        let written = 0;
-                        let lastPct = -1;
-
-                        try {
-                            const readStream = wtFile.createReadStream();
-                            await new Promise((resolve, reject) => {
-                                readStream.on('data', async (chunk) => {
-                                    readStream.pause();
-                                    try {
-                                        const buf = ArrayBuffer.isView(chunk)
-                                            ? chunk
-                                            : new Uint8Array(chunk);
-                                        await writable.write(buf);
-                                        written += buf.byteLength;
-                                        if (totalBytes > 0) {
-                                            const pct = Math.round((written / totalBytes) * 100);
-                                            if (pct > lastPct) {
-                                                lastPct = pct;
-                                                warningText.value = `儲存中... ${pct}%`;
-                                            }
-                                        }
-                                        readStream.resume();
-                                    } catch (e) {
-                                        reject(e);
-                                    }
-                                });
-                                readStream.on('end', resolve);
-                                readStream.on('error', reject);
-                            });
-                            await writable.close();
-                            return true;
-                        } catch (e) {
-                            try { await writable.abort(); } catch (_) {}
-                            throw e;
-                        }
-                    }
-
-                    async function saveCompletedFile(file) {
-                        const fileId = file.fileId;
-                        if (saveBusy.value[fileId]) {
-                            return;
-                        }
-
-                        saveBusy.value[fileId] = true;
-                        const session = torrentSessions[fileId];
-
-                        try {
-                            if (!session?.torrent) {
-                                warningText.value = '此檔案目前未在分享 session 中，無法寫入。';
-                                return;
-                            }
-
-                            if (window.showDirectoryPicker || window.showSaveFilePicker) {
-                                const saved = await saveFromIdbStore(file, session.torrent);
-                                if (saved) {
-                                    warningText.value = '檔案已儲存到本機。';
-                                }
-                                return;
-                            }
-
-                            // 當兩個 File System APIs 都不支援時，只能靠傳統 Blob 下載 (受最大記憶體限制)
-                            if ((file.fileSize || 0) <= MAX_BLOB_SAVE_BYTES) {
-                                await persistTorrentFile(file, session.torrent);
-                                warningText.value = '檔案已下載至本機（傳統模式）。';
-                                return;
-                            }
-
-                            warningText.value = '此瀏覽器不支援大型檔案串流儲存 (File System API)，請改用 Chrome 或 Edge 等主流瀏覽器。';
-                        } catch (error) {
-                            if (error.name !== 'AbortError') {
-                                const state = ensureDownloadState(fileId);
-                                state.errorCode = String(error);
-                            }
-                        } finally {
-                            saveBusy.value[fileId] = false;
-                        }
-                    }
-
                     async function downloadFile(file) {
                         const state = ensureDownloadState(file.fileId);
                         if (state.phase === 'downloading' || state.phase === 'seeding') {
                             return;
                         }
 
-                        try {
-                            if (window.showDirectoryPicker) {
-                                const dirHandle = await ensureSaveDirectoryReady();
-                                if (!dirHandle) {
-                                    warningText.value = '已取消目錄授權，未開始下載。';
-                                    return;
-                                }
-                            } else if (!window.showSaveFilePicker && (file.fileSize || 0) > MAX_BLOB_SAVE_BYTES) {
-                                warningText.value = '注意：此環境不支援原生大檔串流寫入，5GB 下載完成後可能發生記憶體錯誤。';
-                            }
-                        } catch (error) {
-                            state.phase = 'error';
-                            state.errorCode = String(error);
+                        if (!directoryReady.value || !dirHandle.value) {
+                            warningText.value = '請先選擇下載資料夾。';
                             return;
                         }
 
@@ -1356,25 +1155,28 @@ async fn download_page_handler() -> impl IntoResponse {
 
                         try {
                             const client = ensureClient();
-                            // 永遠使用 .torrent bytes：包含完整 metadata（pieces 雜湊值），
-                            // web seed 才能在無 P2P peer 的 LAN 環境下正常下載。
-                            // 若改用 magnet URI，WebTorrent 需要先向 peer 取 metadata，
-                            // 在沒有外部 peer 的情況下永遠卡在 0%。
                             const torrentBytes = await fetchTorrentBytes(file.fileId);
 
+                            const fileHandle = await dirHandle.value.getFileHandle(file.fileName, { create: true });
+
+                            const currentDirHandle = dirHandle.value;
                             const torrent = client.add(torrentBytes, {
-                                store: IdbChunkStore,
+                                store: function(chunkLength, storeOpts) {
+                                    return new FileSystemChunkStore(chunkLength, {
+                                        ...storeOpts,
+                                        fileHandle,
+                                        dirHandle: currentDirHandle,
+                                        fileName: file.fileName,
+                                    });
+                                },
                                 destroyStoreOnDestroy: false
                             });
                             
-                            // 限制並行 peer 連線數 (改進 1)
                             const MAX_CONCURRENT_PEERS = 15;
                             if (typeof torrent.setMaxConns === 'function') {
                                 torrent.setMaxConns(MAX_CONCURRENT_PEERS);
                             }
                             
-                            // error handler 必須最先附上，避免 EventEmitter 在 handler 尚未
-                            // 附上前發出 'error' 事件而變成 Uncaught 錯誤。
                             torrent.on('error', (error) => {
                                 destroySession(file.fileId, 'error');
                                 state.errorCode = String(error);
@@ -1387,39 +1189,19 @@ async fn download_page_handler() -> impl IntoResponse {
                             torrent.on('wire', () => updateStateFromTorrent(file, torrent));
                             torrent.on('warning', (warning) => {
                                 const msg = String(warning);
-                                // 過濾 tracker WebSocket 連線失敗（LAN 環境下外部 tracker 必然失敗，非真正錯誤）
                                 if (!msg.includes('WebSocket') && !msg.includes('tracker') && !msg.includes('wss://')) {
                                     warningText.value = msg;
                                 }
                                 updateStateFromTorrent(file, torrent);
                             });
-                            torrent.on('done', async () => {
+                            torrent.on('done', () => {
                                 updateStateFromTorrent(file, torrent);
 
                                 state.phase = 'seeding';
                                 state.progressPercent = 100;
                                 state.etaSeconds = 0;
-                                state.sourceMix = torrent.numPeers > 0 ? 'P2P seeding' : 'HTTP web seed 完成';
+                                state.sourceMix = torrent.numPeers > 0 ? 'P2P seeding' : '下載完成';
                                 state.errorCode = null;
-
-                                if (window.showDirectoryPicker) {
-                                    warningText.value = '下載完成，正在將檔案寫入授權目錄...';
-                                    try {
-                                        const saved = await saveFromIdbStore(file, torrent);
-                                        if (saved) {
-                                            warningText.value = '下載完成，已自動寫入授權目錄。';
-                                        } else {
-                                            warningText.value = '尚未完成儲存：請重新授權目錄。';
-                                        }
-                                    } catch (error) {
-                                        state.errorCode = String(error);
-                                        warningText.value = '下載完成，但寫入授權目錄失敗。';
-                                    }
-                                } else {
-                                    // 缺乏目錄授權功能時（或安全上下文限制），必須等待使用者手動觸發按鈕，
-                                    // 否則背景執行會因 "User Gesture Required" 引發 SecurityError 導致崩潰。
-                                    warningText.value = '下載完成，請按左下方「儲存」按鈕手動落地檔案。';
-                                }
 
                                 void reportClientStats(file, torrent, true);
                             });
@@ -1435,23 +1217,35 @@ async fn download_page_handler() -> impl IntoResponse {
 
                     function phaseColor(phase) {
                         if (phase === 'seeding') return 'success';
-                        if (phase === 'downloaded') return 'secondary';
                         if (phase === 'downloading') return 'info';
                         if (phase === 'error') return 'error';
                         return 'grey';
                     }
 
                     function phaseLabel(phase) {
-                        if (phase === 'seeding') return '已下載並分享中';
-                        if (phase === 'downloaded') return '已下載';
+                        if (phase === 'seeding') return '分享中';
                         if (phase === 'downloading') return '下載中';
                         if (phase === 'error') return '失敗';
                         return '待下載';
                     }
 
-                    onMounted(() => {
+                    onMounted(async () => {
+                        if (!window.showDirectoryPicker) {
+                            browserSupported.value = false;
+                            statusText.value = '本系統僅支援 File System Access API 之瀏覽器（如 Chrome、Edge）。';
+                            return;
+                        }
+
                         loadMetadata();
                         timerId.value = setInterval(loadMetadata, 5000);
+
+                        const saved = await loadSavedDirectoryHandle();
+                        if (saved) {
+                            try {
+                                const ok = await activateDirectory(saved);
+                                if (ok) return;
+                            } catch (_) {}
+                        }
                     });
 
                     onUnmounted(() => {
@@ -1468,11 +1262,13 @@ async fn download_page_handler() -> impl IntoResponse {
                         metadataError,
                         files,
                         downloads,
+                        browserSupported,
+                        directoryReady,
+                        dirName,
                         loadMetadata,
                         downloadFile,
                         stopTransfer,
-                        saveCompletedFile,
-                        saveBusy,
+                        pickDirectory,
                         phaseColor,
                         phaseLabel,
                         formatBytes,
@@ -1497,90 +1293,99 @@ async fn download_page_handler() -> impl IntoResponse {
                                     </v-card-title>
                                     <v-card-subtitle>版本： v__APP_VERSION__ By Loren(loren.tw@gmail.com)</v-card-subtitle>
                                     <v-card-text>
-                                        <v-alert type="info" variant="tonal" class="mb-3">{{ statusText }}</v-alert>
-                                        <v-alert v-if="warningText" type="warning" variant="tonal" class="mb-3">{{ warningText }}</v-alert>
-                                        <v-alert v-if="metadataError" type="error" variant="tonal" class="mb-3">
-                                            讀取 metadata 失敗：{{ metadataError }}
-                                            <template #append>
-                                                <v-btn size="small" color="error" variant="text" @click="loadMetadata">重試</v-btn>
-                                            </template>
+                                        <v-alert v-if="!browserSupported" type="error" variant="tonal" class="mb-3">
+                                            {{ statusText }}
+                                            <div class="tiny mt-2">請改用 Chrome、Edge 或其他支援 File System Access API 的瀏覽器。</div>
                                         </v-alert>
 
-                                        <v-card v-if="metadata" variant="outlined" class="mb-4">
-                                            <v-card-text class="d-flex flex-wrap ga-4">
-                                                <div>檔案數：<strong>{{ metadata.fileCount }}</strong></div>
-                                                <div>總大小：<strong>{{ formatBytes(metadata.totalSize) }}</strong></div>
-                                            </v-card-text>
-                                        </v-card>
-
-                                        <v-list v-if="files.length" lines="three" class="rounded-lg border">
-                                            <v-list-item
-                                                v-for="file in files"
-                                                :key="file.fileId"
-                                                :title="file.fileName"
-                                                :subtitle="formatBytes(file.fileSize)"
-                                            >
+                                        <template v-if="browserSupported">
+                                            <v-alert type="info" variant="tonal" class="mb-3">{{ statusText }}</v-alert>
+                                            <v-alert v-if="warningText" type="warning" variant="tonal" class="mb-3">{{ warningText }}</v-alert>
+                                            <v-alert v-if="metadataError" type="error" variant="tonal" class="mb-3">
+                                                讀取 metadata 失敗：{{ metadataError }}
                                                 <template #append>
-                                                    <div style="min-width: 340px" class="d-flex align-center ga-2">
-                                                        <v-chip
-                                                            size="small"
-                                                            :color="phaseColor(downloads[file.fileId]?.phase || 'idle')"
-                                                            variant="flat"
-                                                        >
-                                                            {{ phaseLabel(downloads[file.fileId]?.phase || 'idle') }}
-                                                        </v-chip>
-
-                                                        <v-btn
-                                                            size="small"
-                                                            :color="downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading' ? 'warning' : 'primary'"
-                                                            @click="downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading' ? stopTransfer(file.fileId) : downloadFile(file)"
-                                                        >
-                                                            {{ downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading' ? '停止' : '下載' }}
-                                                        </v-btn>
-
-                                                        <v-btn
-                                                            v-if="downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloaded'"
-                                                            size="small"
-                                                            color="secondary"
-                                                            variant="outlined"
-                                                            :loading="saveBusy[file.fileId]"
-                                                            :disabled="saveBusy[file.fileId]"
-                                                            @click="saveCompletedFile(file)"
-                                                        >
-                                                            儲存
-                                                        </v-btn>
-                                                    </div>
+                                                    <v-btn size="small" color="error" variant="text" @click="loadMetadata">重試</v-btn>
                                                 </template>
+                                            </v-alert>
 
-                                                <template #subtitle>
-                                                    <div>
-                                                        <div class="mb-1">{{ formatBytes(file.fileSize) }}</div>
-                                                        <v-progress-linear
-                                                            v-if="downloads[file.fileId]?.phase === 'downloading'"
-                                                            :model-value="downloads[file.fileId]?.progressPercent || 0"
-                                                            color="info"
-                                                            rounded
-                                                            height="10"
-                                                        />
-                                                        <div v-if="downloads[file.fileId]?.phase === 'downloading'" class="tiny mt-1">
-                                                            {{ downloads[file.fileId]?.progressPercent || 0 }}% ・
-                                                            {{ formatBytes(downloads[file.fileId]?.bytesReceived || 0) }} /
-                                                            {{ formatBytes(downloads[file.fileId]?.totalBytes || file.fileSize) }} ・
-                                                            {{ formatBytes(downloads[file.fileId]?.speedBps || 0) }}/s ・
-                                                            ETA {{ downloads[file.fileId]?.etaSeconds || 0 }}s
-                                                        </div>
-                                                        <div v-if="downloads[file.fileId]?.phase === 'downloading' || downloads[file.fileId]?.phase === 'seeding'" class="tiny mt-1">
-                                                            {{ downloads[file.fileId]?.sourceMix || 'P2P + HTTP web seed' }}
-                                                        </div>
-                                                        <div v-if="downloads[file.fileId]?.phase === 'error'" class="tiny" style="color:#b91c1c">
-                                                            {{ downloads[file.fileId]?.errorCode }}
-                                                        </div>
-                                                    </div>
-                                                </template>
-                                            </v-list-item>
-                                        </v-list>
+                                            <v-card variant="outlined" class="mb-4">
+                                                <v-card-text class="d-flex flex-wrap align-center ga-4">
+                                                    <template v-if="directoryReady">
+                                                        <v-icon size="small" color="success" class="mr-1">mdi-folder-check</v-icon>
+                                                        <span>下載資料夾：<strong>{{ dirName }}</strong></span>
+                                                        <v-btn size="small" variant="text" color="primary" @click="pickDirectory">變更資料夾</v-btn>
+                                                    </template>
+                                                    <template v-else>
+                                                        <v-icon size="small" color="warning" class="mr-1">mdi-folder-alert</v-icon>
+                                                        <span>請先選擇下載資料夾才能開始下載</span>
+                                                        <v-btn size="small" color="primary" @click="pickDirectory">選擇下載資料夾</v-btn>
+                                                    </template>
+                                                    <template v-if="metadata">
+                                                        <v-divider vertical class="mx-2" />
+                                                        <div>檔案數：<strong>{{ metadata.fileCount }}</strong></div>
+                                                        <div>總大小：<strong>{{ formatBytes(metadata.totalSize) }}</strong></div>
+                                                    </template>
+                                                </v-card-text>
+                                            </v-card>
 
-                                        <v-alert v-else type="warning" variant="tonal">目前沒有可下載檔案。</v-alert>
+                                            <v-list v-if="files.length" lines="three" class="rounded-lg border">
+                                                <v-list-item
+                                                    v-for="file in files"
+                                                    :key="file.fileId"
+                                                    :title="file.fileName"
+                                                    :subtitle="formatBytes(file.fileSize)"
+                                                >
+                                                    <template #append>
+                                                        <div style="min-width: 280px" class="d-flex align-center ga-2">
+                                                            <v-chip
+                                                                size="small"
+                                                                :color="phaseColor(downloads[file.fileId]?.phase || 'idle')"
+                                                                variant="flat"
+                                                            >
+                                                                {{ phaseLabel(downloads[file.fileId]?.phase || 'idle') }}
+                                                            </v-chip>
+
+                                                            <v-btn
+                                                                size="small"
+                                                                :color="downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading' ? 'warning' : 'primary'"
+                                                                :disabled="!directoryReady && !(downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading')"
+                                                                @click="downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading' ? stopTransfer(file.fileId) : downloadFile(file)"
+                                                            >
+                                                                {{ downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading' ? '停止' : '下載' }}
+                                                            </v-btn>
+                                                        </div>
+                                                    </template>
+
+                                                    <template #subtitle>
+                                                        <div>
+                                                            <div class="mb-1">{{ formatBytes(file.fileSize) }}</div>
+                                                            <v-progress-linear
+                                                                v-if="downloads[file.fileId]?.phase === 'downloading'"
+                                                                :model-value="downloads[file.fileId]?.progressPercent || 0"
+                                                                color="info"
+                                                                rounded
+                                                                height="10"
+                                                            />
+                                                            <div v-if="downloads[file.fileId]?.phase === 'downloading'" class="tiny mt-1">
+                                                                {{ downloads[file.fileId]?.progressPercent || 0 }}% ・
+                                                                {{ formatBytes(downloads[file.fileId]?.bytesReceived || 0) }} /
+                                                                {{ formatBytes(downloads[file.fileId]?.totalBytes || file.fileSize) }} ・
+                                                                {{ formatBytes(downloads[file.fileId]?.speedBps || 0) }}/s ・
+                                                                ETA {{ downloads[file.fileId]?.etaSeconds || 0 }}s
+                                                            </div>
+                                                            <div v-if="downloads[file.fileId]?.phase === 'downloading' || downloads[file.fileId]?.phase === 'seeding'" class="tiny mt-1">
+                                                                {{ downloads[file.fileId]?.sourceMix || 'P2P + HTTP web seed' }}
+                                                            </div>
+                                                            <div v-if="downloads[file.fileId]?.phase === 'error'" class="tiny" style="color:#b91c1c">
+                                                                {{ downloads[file.fileId]?.errorCode }}
+                                                            </div>
+                                                        </div>
+                                                    </template>
+                                                </v-list-item>
+                                            </v-list>
+
+                                            <v-alert v-else type="warning" variant="tonal">目前沒有可下載檔案。</v-alert>
+                                        </template>
                                     </v-card-text>
                                 </v-card>
                             </v-container>
