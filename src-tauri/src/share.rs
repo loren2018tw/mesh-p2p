@@ -592,7 +592,7 @@ async fn ensure_server_running(runtime: Arc<Mutex<ShareRuntime>>) -> Result<Stri
         .map_err(|e| format!("Failed to set listener non-blocking: {e}"))?;
 
     let host_ip = detect_host_ip();
-    let base_url = format!("http://{}:{}", host_ip, addr.port());
+    let base_url = format!("https://{}:{}", host_ip, addr.port());
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -614,19 +614,27 @@ async fn ensure_server_running(runtime: Arc<Mutex<ShareRuntime>>) -> Result<Stri
         .with_state(http_state)
         .layer(tower_http::cors::CorsLayer::permissive());
 
-    let tokio_listener = tokio::net::TcpListener::from_std(listener)
-        .map_err(|e| format!("Failed to convert listener: {e}"))?;
-
     tauri::async_runtime::spawn(async move {
-        let server = axum::serve(
-            tokio_listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
+        let cert = include_bytes!("../certs/cert.pem").to_vec();
+        let key = include_bytes!("../certs/key.pem").to_vec();
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert, key)
+            .await
+            .expect("Failed to load embedded TLS certificate/key");
+
+        let handle = axum_server::Handle::new();
+        let handle_clone = handle.clone();
+        tokio::spawn(async move {
             let _ = shutdown_rx.await;
+            handle_clone.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
         });
 
-        if let Err(err) = server.await {
+        let server_result = axum_server::from_tcp_rustls(listener.try_clone().unwrap(), tls_config)
+            .unwrap()
+            .handle(handle)
+            .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+            .await;
+
+        if let Err(err) = server_result {
             eprintln!("Share server failed: {err}");
         }
     });
