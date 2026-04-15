@@ -27,7 +27,23 @@ use tokio::{
     sync::{oneshot, Semaphore},
 };
 
-const DEFAULT_PIECE_SIZE: usize = 256 * 1024;
+/// 依檔案大小選擇適當的 piece size，大檔案使用較大 piece 以減少 piece 數量。
+/// 目標：piece 數量控制在 2,000–10,000 之間。
+fn piece_size_for_file(file_size: u64) -> usize {
+    if file_size <= 256 * 1024 * 1024 {
+        // ≤ 256 MB → 256 KB pieces
+        256 * 1024
+    } else if file_size <= 1024 * 1024 * 1024 {
+        // ≤ 1 GB → 512 KB pieces
+        512 * 1024
+    } else if file_size <= 4 * 1024 * 1024 * 1024 {
+        // ≤ 4 GB → 1 MB pieces
+        1024 * 1024
+    } else {
+        // > 4 GB → 2 MB pieces
+        2 * 1024 * 1024
+    }
+}
 const RATE_LIMIT_WINDOW_MS: u64 = 1000;
 const RATE_LIMIT_MAX: usize = 5000;
 const CLIENT_ACTIVITY_WINDOW_SECS: u64 = 300;
@@ -812,42 +828,64 @@ async fn download_page_handler() -> impl IntoResponse {
             const CLIENT_ID = `dl-${Math.random().toString(36).slice(2)}-${Date.now()}`;
 
             // FileSystemChunkStore: 透過 File System Access API 直接讀寫檔案系統，
-            // 取代 IdbChunkStore，下載完成即存在磁碟上，無須手動儲存。
+            // 下載期間使用 .mesh-download 暫存檔名，完成後才寫入正式檔名。
+            // 中途停止或瀏覽器關閉不會產生損壞的正式檔。
             class FileSystemChunkStore {
                 constructor(chunkLength, opts) {
                     this.chunkLength = chunkLength;
                     this.length = opts.length || 0;
-                    this.fileHandle = opts.fileHandle;
                     this.dirHandle = opts.dirHandle;
                     this.fileName = opts.fileName;
+                    this._tempFileName = this.fileName + '.mesh-download';
+                    this._tempFileHandle = null;
+                    this._finalFileHandle = null;
+                    this._writable = null;
+                    this._writableReady = null;
                     this._writeQueue = Promise.resolve();
+                    this._closed = false;
+                    this._committed = false;
+                }
+
+                _ensureWritable() {
+                    if (!this._writableReady) {
+                        this._writableReady = (async () => {
+                            if (!this._tempFileHandle) {
+                                this._tempFileHandle = await this.dirHandle.getFileHandle(this._tempFileName, { create: true });
+                            }
+                            const w = await this._tempFileHandle.createWritable({ keepExistingData: true });
+                            this._writable = w;
+                            return w;
+                        })();
+                    }
+                    return this._writableReady;
                 }
 
                 put(index, buf, cb) {
                     this._writeQueue = this._writeQueue.then(async () => {
+                        if (this._closed) { cb(new Error('Store is closed')); return; }
                         try {
-                            const writable = await this.fileHandle.createWritable({ keepExistingData: true });
+                            const writable = await this._ensureWritable();
                             const offset = index * this.chunkLength;
                             await writable.seek(offset);
                             await writable.write(buf);
-                            await writable.close();
                             cb(null);
                         } catch (err) {
+                            this._writable = null;
+                            this._writableReady = null;
                             cb(err);
                         }
                     });
                 }
 
                 get(index, opts, cb) {
-                    if (typeof opts === 'function') {
-                        cb = opts;
-                        opts = {};
-                    }
+                    if (typeof opts === 'function') { cb = opts; opts = {}; }
                     const offset = (opts && opts.offset) || 0;
                     const len = opts && opts.length != null ? opts.length : null;
                     const byteOffset = index * this.chunkLength + offset;
                     const byteLength = len != null ? len : this.chunkLength;
-                    this.fileHandle.getFile().then((file) => {
+                    const handle = this._finalFileHandle || this._tempFileHandle;
+                    if (!handle) { cb(new Error('File not ready')); return; }
+                    handle.getFile().then((file) => {
                         const slice = file.slice(byteOffset, byteOffset + byteLength);
                         return slice.arrayBuffer();
                     }).then((ab) => {
@@ -857,20 +895,59 @@ async fn download_page_handler() -> impl IntoResponse {
                     });
                 }
 
+                commit() {
+                    return new Promise((resolve, reject) => {
+                        this._writeQueue = this._writeQueue.then(async () => {
+                            try {
+                                // 1. 關閉 writable → .crswap 原子寫入暫存檔
+                                if (this._writable) {
+                                    await this._writable.close();
+                                    this._writable = null;
+                                    this._writableReady = null;
+                                }
+                                // 2. 暫存檔串流寫入正式檔名
+                                const tempFile = await this._tempFileHandle.getFile();
+                                this._finalFileHandle = await this.dirHandle.getFileHandle(this.fileName, { create: true });
+                                const finalWritable = await this._finalFileHandle.createWritable();
+                                await tempFile.stream().pipeTo(finalWritable);
+                                // 3. 刪除暫存檔
+                                await this.dirHandle.removeEntry(this._tempFileName).catch(() => {});
+                                this._committed = true;
+                                resolve();
+                            } catch (err) {
+                                reject(err);
+                            }
+                        });
+                    });
+                }
+
+                _abort() {
+                    return this._writeQueue = this._writeQueue.then(async () => {
+                        try {
+                            if (this._writable) {
+                                await this._writable.abort().catch(() => {});
+                                this._writable = null;
+                                this._writableReady = null;
+                            }
+                            if (this.dirHandle && this._tempFileName) {
+                                await this.dirHandle.removeEntry(this._tempFileName).catch(() => {});
+                            }
+                        } catch (_) {}
+                    });
+                }
+
                 close(cb) {
-                    if (cb) cb(null);
+                    this._closed = true;
+                    if (this._committed) {
+                        if (cb) cb(null);
+                    } else {
+                        this._abort().then(() => { if (cb) cb(null); }).catch((err) => { if (cb) cb(err); });
+                    }
                 }
 
                 destroy(cb) {
-                    if (this.dirHandle && this.fileName) {
-                        this.dirHandle.removeEntry(this.fileName).then(() => {
-                            if (cb) cb(null);
-                        }).catch((err) => {
-                            if (cb) cb(err);
-                        });
-                    } else {
-                        if (cb) cb(null);
-                    }
+                    this._closed = true;
+                    this._abort().then(() => { if (cb) cb(null); }).catch((err) => { if (cb) cb(err); });
                 }
             }
 
@@ -1165,17 +1242,16 @@ async fn download_page_handler() -> impl IntoResponse {
                             const client = ensureClient();
                             const torrentBytes = await fetchTorrentBytes(file.fileId);
 
-                            const fileHandle = await dirHandle.value.getFileHandle(file.fileName, { create: true });
-
                             const currentDirHandle = dirHandle.value;
+                            let chunkStore = null;
                             const torrent = client.add(torrentBytes, {
                                 store: function(chunkLength, storeOpts) {
-                                    return new FileSystemChunkStore(chunkLength, {
+                                    chunkStore = new FileSystemChunkStore(chunkLength, {
                                         ...storeOpts,
-                                        fileHandle,
                                         dirHandle: currentDirHandle,
                                         fileName: file.fileName,
                                     });
+                                    return chunkStore;
                                 },
                                 destroyStoreOnDestroy: false
                             });
@@ -1202,8 +1278,18 @@ async fn download_page_handler() -> impl IntoResponse {
                                 }
                                 updateStateFromTorrent(file, torrent);
                             });
-                            torrent.on('done', () => {
+                            torrent.on('done', async () => {
                                 updateStateFromTorrent(file, torrent);
+
+                                // 關閉 writable stream，將 .crswap 臨時檔 flush 為正式檔案
+                                // commit() 後 get() 仍可透過 fileHandle.getFile() 繼續 seeding
+                                if (chunkStore) {
+                                    try {
+                                        await chunkStore.commit();
+                                    } catch (err) {
+                                        console.warn('commit writable failed:', err);
+                                    }
+                                }
 
                                 state.phase = 'seeding';
                                 state.progressPercent = 100;
@@ -2176,7 +2262,7 @@ async fn build_seed_metadata(
         .map(|d| d.as_millis())
         .unwrap_or(0);
 
-    let piece_size = DEFAULT_PIECE_SIZE;
+    let piece_size = piece_size_for_file(file_size);
     let expected_piece_count = if file_size == 0 {
         1
     } else {

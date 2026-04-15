@@ -1,6 +1,14 @@
 # mesh-p2p
 
-mesh-p2p 是一個使用 Vue 3、Vite、TypeScript 與 Tauri 2 建構的桌面應用程式。
+mesh-p2p 是一個使用 Vue 3、Vite、TypeScript 與 Tauri 2 建構的桌面應用程式，專為區域網路內的大檔案傳輸設計。
+
+### 核心特色
+
+- **P2P 協同分享**：當多位使用者同時下載同一檔案時，已完成下載的使用者會自動成為 seeder，與分享者共同提供 piece 給其他下載者。下載人數越多，整體傳輸效率越高，分享者不再是唯一瓶頸。
+- **混合傳輸模式**：結合 WebTorrent P2P swarm 與 HTTP web seed fallback。P2P 可用時走 peer 交換；P2P 不可達時自動回退到 HTTP 直傳，確保任何網路環境下都能完成傳輸。
+- **大檔案友善**：依檔案大小動態調整 piece size（256KB–2MB），5GB 檔案僅產生約 2,560 pieces，降低 metadata 開銷與記憶體壓力。下載端透過 File System Access API 直接寫入磁碟，不經記憶體緩衝，避免大檔案 OOM。
+- **零操作完成**：下載完成後檔案直接存在於使用者選擇的資料夾中，無須手動儲存。下載期間使用暫存檔，中途停止或瀏覽器關閉不會留下損壞檔案。
+- **免安裝下載端**：分享者啟動桌面應用後，下載者只需用 Chrome/Edge 開啟分享連結即可下載，無須安裝任何軟體。
 
 ## 開發
 
@@ -35,29 +43,6 @@ pnpm tauri build
 - 再次分享同一路徑檔案時，若檔案大小與修改時間符合既有描述檔，系統會重用既有 piece hashes，避免重新計算。
 - 下載頁會透過 WebTorrent 啟動 torrent lifecycle，並使用分享端提供的 HTTP web seed 作為 fallback。
 - 檔案下載完成後，瀏覽器頁面會在存活期間持續 seeding；關閉頁面或按下停止後會回收該 seeding session。
-- 目前未實作一般瀏覽器自動掃描本地下載資料夾；本地快取重用將在後續 change 處理。
-
-### WebTorrent Replay Script
-
-啟動分享後，可用下列命令重播 WebTorrent 下載/做種流程：
-
-```bash
-pnpm replay:webtorrent -- <share-url> [file-id]
-```
-
-範例：
-
-```bash
-pnpm replay:webtorrent -- http://192.168.1.10:38451
-```
-
-此腳本會：
-
-1. 讀取 metadata API。
-2. 下載對應 torrent descriptor。
-3. 啟動兩個 WebTorrent client。
-4. 讓第一個 client 先完成下載並保持 seeding。
-5. 驗證第二個 client 是否能以相同 torrent lifecycle 完成下載，並輸出是否偵測到 peer 連線。
 
 ## GitHub Actions 發版
 
