@@ -802,6 +802,81 @@ async fn download_page_handler() -> impl IntoResponse {
 
             const SUPPORTED_METADATA_VERSION = 1;
             const CLIENT_ID = `dl-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+            const MAX_BLOB_SAVE_BYTES = 1024 * 1024 * 1024; // 1GB: avoid browser blob allocation failure
+
+            // IdbChunkStore: 使用 IndexedDB 存放 WebTorrent pieces，避免大檔案佔滿 JS heap。
+            class IdbChunkStore {
+                constructor(chunkLength, opts) {
+                    this.chunkLength = chunkLength;
+                    this.length = opts.length || 0;
+                    this.name = `wt-${opts.name || 'store'}`;
+                    this._ready = new Promise((resolve, reject) => {
+                        const req = indexedDB.open(this.name, 1);
+                        req.onupgradeneeded = (e) => e.target.result.createObjectStore('c');
+                        req.onsuccess = (e) => resolve(e.target.result);
+                        req.onerror = (e) => reject(e.target.error);
+                    });
+                }
+
+                put(index, buf, cb) {
+                    this._ready
+                        .then((db) => {
+                            const tx = db.transaction('c', 'readwrite');
+                            tx.objectStore('c').put(buf, index).onsuccess = () => cb(null);
+                            tx.onerror = (e) => cb(e.target.error);
+                        })
+                        .catch(cb);
+                }
+
+                get(index, opts, cb) {
+                    if (typeof opts === 'function') {
+                        cb = opts;
+                        opts = {};
+                    }
+                    const offset = (opts && opts.offset) || 0;
+                    const len = opts && opts.length != null ? opts.length : null;
+                    this._ready
+                        .then((db) => {
+                            const req = db.transaction('c', 'readonly').objectStore('c').get(index);
+                            req.onsuccess = (e) => {
+                                let chunk = e.target.result;
+                                if (!chunk) {
+                                    return cb(null, new Uint8Array(len != null ? len : this.chunkLength));
+                                }
+                                if (offset !== 0 || len != null) {
+                                    chunk = chunk.slice(
+                                        offset,
+                                        offset + (len != null ? len : chunk.length - offset)
+                                    );
+                                }
+                                cb(null, chunk);
+                            };
+                            req.onerror = (e) => cb(e.target.error);
+                        })
+                        .catch(cb);
+                }
+
+                close(cb) {
+                    if (cb) cb(null);
+                }
+
+                destroy(cb) {
+                    this._ready
+                        .then((db) => {
+                            db.close();
+                            const req = indexedDB.deleteDatabase(this.name);
+                            req.onsuccess = () => {
+                                if (cb) cb(null);
+                            };
+                            req.onerror = (e) => {
+                                if (cb) cb(e.target.error);
+                            };
+                        })
+                        .catch((err) => {
+                            if (cb) cb(err);
+                        });
+                }
+            }
 
             createApp({
                 setup() {
@@ -812,8 +887,14 @@ async fn download_page_handler() -> impl IntoResponse {
                     const lastRevision = ref(-1);
                     const timerId = ref(null);
                     const downloads = ref({});
+                    const saveBusy = ref({});
+                    const saveDirHandle = ref(null);
                     let torrentClient = null;
                     const torrentSessions = {};
+
+                    const SAVE_DIR_DB_NAME = 'mesh-p2p-app';
+                    const SAVE_DIR_DB_STORE = 'kv';
+                    const SAVE_DIR_KEY = 'downloadDirHandle';
 
                     const files = computed(() => metadata.value?.files ?? []);
 
@@ -840,10 +921,95 @@ async fn download_page_handler() -> impl IntoResponse {
                                 errorCode: null,
                                 startedAt: 0,
                                 lastTickAt: 0,
+                                lastBytesReceived: 0,
                                 smoothedSpeedBps: 0,
                             };
                         }
                         return downloads.value[fileId];
+                    }
+
+                    function openSaveDirDb() {
+                        return new Promise((resolve, reject) => {
+                            const req = indexedDB.open(SAVE_DIR_DB_NAME, 1);
+                            req.onupgradeneeded = (e) => {
+                                const db = e.target.result;
+                                if (!db.objectStoreNames.contains(SAVE_DIR_DB_STORE)) {
+                                    db.createObjectStore(SAVE_DIR_DB_STORE);
+                                }
+                            };
+                            req.onsuccess = (e) => resolve(e.target.result);
+                            req.onerror = (e) => reject(e.target.error);
+                        });
+                    }
+
+                    async function loadSavedDirectoryHandle() {
+                        try {
+                            const db = await openSaveDirDb();
+                            return await new Promise((resolve, reject) => {
+                                const tx = db.transaction(SAVE_DIR_DB_STORE, 'readonly');
+                                const req = tx.objectStore(SAVE_DIR_DB_STORE).get(SAVE_DIR_KEY);
+                                req.onsuccess = () => resolve(req.result || null);
+                                req.onerror = (e) => reject(e.target.error);
+                            });
+                        } catch (_) {
+                            return null;
+                        }
+                    }
+
+                    async function persistDirectoryHandle(handle) {
+                        const db = await openSaveDirDb();
+                        await new Promise((resolve, reject) => {
+                            const tx = db.transaction(SAVE_DIR_DB_STORE, 'readwrite');
+                            tx.objectStore(SAVE_DIR_DB_STORE).put(handle, SAVE_DIR_KEY);
+                            tx.oncomplete = resolve;
+                            tx.onerror = (e) => reject(e.target.error);
+                        });
+                    }
+
+                    async function hasDirectoryWritePermission(handle) {
+                        if (!handle) return false;
+                        const opts = { mode: 'readwrite' };
+                        const queried = await handle.queryPermission(opts);
+                        if (queried === 'granted') return true;
+                        const requested = await handle.requestPermission(opts);
+                        return requested === 'granted';
+                    }
+
+                    async function ensureSaveDirectoryReady() {
+                        if (!window.showDirectoryPicker) {
+                            return null;
+                        }
+
+                        if (!saveDirHandle.value) {
+                            saveDirHandle.value = await loadSavedDirectoryHandle();
+                        }
+
+                        if (await hasDirectoryWritePermission(saveDirHandle.value)) {
+                            return saveDirHandle.value;
+                        }
+
+                        let picked;
+                        try {
+                            picked = await window.showDirectoryPicker({ mode: 'readwrite' });
+                        } catch (err) {
+                            if (err.name === 'AbortError') {
+                                return null;
+                            }
+                            throw err;
+                        }
+
+                        const granted = await hasDirectoryWritePermission(picked);
+                        if (!granted) {
+                            throw new Error('未取得目錄寫入權限，無法開始下載。');
+                        }
+
+                        saveDirHandle.value = picked;
+                        try {
+                            await persistDirectoryHandle(picked);
+                        } catch (_) {
+                            // 忽略持久化失敗：至少本次執行仍可使用已授權目錄。
+                        }
+                        return picked;
                     }
 
                     async function reportClientStats(file, torrent, isSeeding) {
@@ -963,17 +1129,32 @@ async fn download_page_handler() -> impl IntoResponse {
 
                     function updateStateFromTorrent(file, torrent) {
                         const state = ensureDownloadState(file.fileId);
+                        const currentBytes = torrent.downloaded || 0;
+                        const currentTick = nowMs();
+                        const elapsedMs = Math.max(1, currentTick - (state.lastTickAt || currentTick));
+                        const deltaBytes = Math.max(0, currentBytes - (state.lastBytesReceived || 0));
+                        const measuredSpeed = Math.round((deltaBytes * 1000) / elapsedMs);
+                        const reportedSpeed = Math.round(torrent.downloadSpeed || 0);
+
                         state.totalBytes = torrent.length || file.fileSize || 0;
-                        state.bytesReceived = torrent.downloaded || 0;
+                        state.bytesReceived = currentBytes;
                         state.progressPercent = state.totalBytes > 0
                             ? Math.min(100, Math.round((state.bytesReceived / state.totalBytes) * 100))
                             : 0;
-                        state.speedBps = Math.round(torrent.downloadSpeed || 0);
+                        // Prefer measured byte delta; blend with WebTorrent internal speed to reduce jitter.
+                        const blended = measuredSpeed > 0
+                            ? Math.round((measuredSpeed * 0.7) + (reportedSpeed * 0.3))
+                            : reportedSpeed;
+                        state.smoothedSpeedBps = state.smoothedSpeedBps > 0
+                            ? Math.round((state.smoothedSpeedBps * 0.8) + (blended * 0.2))
+                            : blended;
+                        state.speedBps = Math.max(0, state.smoothedSpeedBps);
                         state.etaSeconds = state.speedBps > 0 && state.totalBytes > state.bytesReceived
                             ? Math.ceil((state.totalBytes - state.bytesReceived) / state.speedBps)
                             : 0;
                         state.sourceMix = torrent.numPeers > 0 ? 'P2P + HTTP web seed' : 'HTTP web seed fallback';
-                        state.lastTickAt = nowMs();
+                        state.lastTickAt = currentTick;
+                        state.lastBytesReceived = currentBytes;
                         void reportClientStats(file, torrent, state.phase === 'seeding' || torrent.progress === 1);
                     }
 
@@ -1030,9 +1211,134 @@ async fn download_page_handler() -> impl IntoResponse {
                         URL.revokeObjectURL(url);
                     }
 
+                    // 從 IndexedDB 串流直接寫入已授權目錄或單檔授權，不走 HTTP、不在記憶體組裝整個 Blob。
+                    async function saveFromIdbStore(file, torrent) {
+                        const wtFile =
+                            torrent.files.find((f) => f.name === file.fileName) ||
+                            torrent.files[0];
+                        if (!wtFile) throw new Error('找不到對應的 torrent 檔案物件');
+
+                        let fileHandle;
+
+                        if (window.showDirectoryPicker) {
+                            const dirHandle = await ensureSaveDirectoryReady();
+                            if (dirHandle) {
+                                fileHandle = await dirHandle.getFileHandle(file.fileName, { create: true });
+                            }
+                        }
+
+                        if (!fileHandle) {
+                            if (window.showSaveFilePicker) {
+                                try {
+                                    fileHandle = await window.showSaveFilePicker({ suggestedName: file.fileName });
+                                } catch (err) {
+                                    if (err.name === 'AbortError') return false;
+                                    throw err;
+                                }
+                            } else {
+                                throw new Error('目錄與單檔授權 API 皆不支援 (File System Access API 缺失)');
+                            }
+                        }
+
+                        const writable = await fileHandle.createWritable();
+                        const totalBytes = wtFile.length || file.fileSize || 0;
+                        let written = 0;
+                        let lastPct = -1;
+
+                        try {
+                            const readStream = wtFile.createReadStream();
+                            await new Promise((resolve, reject) => {
+                                readStream.on('data', async (chunk) => {
+                                    readStream.pause();
+                                    try {
+                                        const buf = ArrayBuffer.isView(chunk)
+                                            ? chunk
+                                            : new Uint8Array(chunk);
+                                        await writable.write(buf);
+                                        written += buf.byteLength;
+                                        if (totalBytes > 0) {
+                                            const pct = Math.round((written / totalBytes) * 100);
+                                            if (pct > lastPct) {
+                                                lastPct = pct;
+                                                warningText.value = `儲存中... ${pct}%`;
+                                            }
+                                        }
+                                        readStream.resume();
+                                    } catch (e) {
+                                        reject(e);
+                                    }
+                                });
+                                readStream.on('end', resolve);
+                                readStream.on('error', reject);
+                            });
+                            await writable.close();
+                            return true;
+                        } catch (e) {
+                            try { await writable.abort(); } catch (_) {}
+                            throw e;
+                        }
+                    }
+
+                    async function saveCompletedFile(file) {
+                        const fileId = file.fileId;
+                        if (saveBusy.value[fileId]) {
+                            return;
+                        }
+
+                        saveBusy.value[fileId] = true;
+                        const session = torrentSessions[fileId];
+
+                        try {
+                            if (!session?.torrent) {
+                                warningText.value = '此檔案目前未在分享 session 中，無法寫入。';
+                                return;
+                            }
+
+                            if (window.showDirectoryPicker || window.showSaveFilePicker) {
+                                const saved = await saveFromIdbStore(file, session.torrent);
+                                if (saved) {
+                                    warningText.value = '檔案已儲存到本機。';
+                                }
+                                return;
+                            }
+
+                            // 當兩個 File System APIs 都不支援時，只能靠傳統 Blob 下載 (受最大記憶體限制)
+                            if ((file.fileSize || 0) <= MAX_BLOB_SAVE_BYTES) {
+                                await persistTorrentFile(file, session.torrent);
+                                warningText.value = '檔案已下載至本機（傳統模式）。';
+                                return;
+                            }
+
+                            warningText.value = '此瀏覽器不支援大型檔案串流儲存 (File System API)，請改用 Chrome 或 Edge 等主流瀏覽器。';
+                        } catch (error) {
+                            if (error.name !== 'AbortError') {
+                                const state = ensureDownloadState(fileId);
+                                state.errorCode = String(error);
+                            }
+                        } finally {
+                            saveBusy.value[fileId] = false;
+                        }
+                    }
+
                     async function downloadFile(file) {
                         const state = ensureDownloadState(file.fileId);
                         if (state.phase === 'downloading' || state.phase === 'seeding') {
+                            return;
+                        }
+
+                        try {
+                            if (window.showDirectoryPicker) {
+                                const dirHandle = await ensureSaveDirectoryReady();
+                                if (!dirHandle) {
+                                    warningText.value = '已取消目錄授權，未開始下載。';
+                                    return;
+                                }
+                            } else if (!window.showSaveFilePicker && (file.fileSize || 0) > MAX_BLOB_SAVE_BYTES) {
+                                warningText.value = '注意：此環境不支援原生大檔串流寫入，5GB 下載完成後可能發生記憶體錯誤。';
+                            }
+                        } catch (error) {
+                            state.phase = 'error';
+                            state.errorCode = String(error);
                             return;
                         }
 
@@ -1045,6 +1351,7 @@ async fn download_page_handler() -> impl IntoResponse {
                         state.errorCode = null;
                         state.startedAt = nowMs();
                         state.lastTickAt = state.startedAt;
+                        state.lastBytesReceived = 0;
                         state.smoothedSpeedBps = 0;
 
                         try {
@@ -1055,7 +1362,10 @@ async fn download_page_handler() -> impl IntoResponse {
                             // 在沒有外部 peer 的情況下永遠卡在 0%。
                             const torrentBytes = await fetchTorrentBytes(file.fileId);
 
-                            const torrent = client.add(torrentBytes, { destroyStoreOnDestroy: false });
+                            const torrent = client.add(torrentBytes, {
+                                store: IdbChunkStore,
+                                destroyStoreOnDestroy: false
+                            });
                             
                             // 限制並行 peer 連線數 (改進 1)
                             const MAX_CONCURRENT_PEERS = 15;
@@ -1085,17 +1395,33 @@ async fn download_page_handler() -> impl IntoResponse {
                             });
                             torrent.on('done', async () => {
                                 updateStateFromTorrent(file, torrent);
-                                try {
-                                    await persistTorrentFile(file, torrent);
-                                    state.phase = 'seeding';
-                                    state.progressPercent = 100;
-                                    state.etaSeconds = 0;
-                                    state.sourceMix = torrent.numPeers > 0 ? 'P2P seeding' : 'HTTP web seed 完成';
-                                    void reportClientStats(file, torrent, true);
-                                } catch (error) {
-                                    state.phase = 'error';
-                                    state.errorCode = String(error);
+
+                                state.phase = 'seeding';
+                                state.progressPercent = 100;
+                                state.etaSeconds = 0;
+                                state.sourceMix = torrent.numPeers > 0 ? 'P2P seeding' : 'HTTP web seed 完成';
+                                state.errorCode = null;
+
+                                if (window.showDirectoryPicker) {
+                                    warningText.value = '下載完成，正在將檔案寫入授權目錄...';
+                                    try {
+                                        const saved = await saveFromIdbStore(file, torrent);
+                                        if (saved) {
+                                            warningText.value = '下載完成，已自動寫入授權目錄。';
+                                        } else {
+                                            warningText.value = '尚未完成儲存：請重新授權目錄。';
+                                        }
+                                    } catch (error) {
+                                        state.errorCode = String(error);
+                                        warningText.value = '下載完成，但寫入授權目錄失敗。';
+                                    }
+                                } else {
+                                    // 缺乏目錄授權功能時（或安全上下文限制），必須等待使用者手動觸發按鈕，
+                                    // 否則背景執行會因 "User Gesture Required" 引發 SecurityError 導致崩潰。
+                                    warningText.value = '下載完成，請按左下方「儲存」按鈕手動落地檔案。';
                                 }
+
+                                void reportClientStats(file, torrent, true);
                             });
                         } catch (error) {
                             state.phase = 'error';
@@ -1104,9 +1430,7 @@ async fn download_page_handler() -> impl IntoResponse {
                     }
 
                     function stopTransfer(fileId) {
-                        const state = ensureDownloadState(fileId);
-                        const nextPhase = (state.bytesReceived >= state.totalBytes && state.totalBytes > 0) ? 'downloaded' : 'idle';
-                        destroySession(fileId, nextPhase);
+                        destroySession(fileId, 'idle');
                     }
 
                     function phaseColor(phase) {
@@ -1147,6 +1471,8 @@ async fn download_page_handler() -> impl IntoResponse {
                         loadMetadata,
                         downloadFile,
                         stopTransfer,
+                        saveCompletedFile,
+                        saveBusy,
                         phaseColor,
                         phaseLabel,
                         formatBytes,
@@ -1210,6 +1536,18 @@ async fn download_page_handler() -> impl IntoResponse {
                                                             @click="downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading' ? stopTransfer(file.fileId) : downloadFile(file)"
                                                         >
                                                             {{ downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloading' ? '停止' : '下載' }}
+                                                        </v-btn>
+
+                                                        <v-btn
+                                                            v-if="downloads[file.fileId]?.phase === 'seeding' || downloads[file.fileId]?.phase === 'downloaded'"
+                                                            size="small"
+                                                            color="secondary"
+                                                            variant="outlined"
+                                                            :loading="saveBusy[file.fileId]"
+                                                            :disabled="saveBusy[file.fileId]"
+                                                            @click="saveCompletedFile(file)"
+                                                        >
+                                                            儲存
                                                         </v-btn>
                                                     </div>
                                                 </template>
@@ -1457,6 +1795,44 @@ async fn file_handler(
         return (StatusCode::RANGE_NOT_SATISFIABLE, "").into_response();
     }
 
+    // 全檔請求 (無 Range header)：用串流回應，不將整檔 buffer 進記憶體
+    if !is_partial {
+        use tokio_util::io::ReaderStream;
+
+        let file_name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("download.bin")
+            .to_string();
+
+        if let Ok(mut guard) = state.runtime.lock() {
+            guard.fallback_transfer_count += 1;
+            guard.last_activity_unix_ms = unix_time_ms();
+        }
+
+        let stream = ReaderStream::new(file);
+        let body = axum::body::Body::from_stream(stream);
+
+        let mut res_headers = axum::http::HeaderMap::new();
+        res_headers.insert(axum::http::header::ACCEPT_RANGES, "bytes".parse().unwrap());
+        res_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        res_headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            file_size.to_string().parse().unwrap(),
+        );
+        res_headers.insert(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{file_name}\"")
+                .parse()
+                .unwrap(),
+        );
+        return (StatusCode::OK, res_headers, body).into_response();
+    }
+
+    // Range 請求路徑：限制單次 chunk 大小，使用 semaphore 控制並行數
     let chunk_size = (end - start + 1) as usize;
     if chunk_size > MAX_CHUNK_SIZE {
         let max_mb = MAX_CHUNK_SIZE / 1024 / 1024;
