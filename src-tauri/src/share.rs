@@ -1,22 +1,25 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::{SocketAddr, TcpListener, UdpSocket},
+    net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
+    body::Body,
     extract::ConnectInfo,
     extract::Path as AxumPath,
     extract::Query,
     extract::State as AxumState,
-    http::StatusCode,
-    response::{Html, IntoResponse},
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use base64::Engine as _;
+use rcgen::generate_simple_self_signed;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tauri::{State, WebviewWindow};
@@ -26,6 +29,14 @@ use tokio::{
     io::AsyncReadExt,
     sync::{oneshot, Semaphore},
 };
+
+macro_rules! dev_log {
+    ($($arg:tt)*) => {
+        if cfg!(debug_assertions) {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 /// 依檔案大小選擇適當的 piece size，大檔案使用較大 piece 以減少 piece 數量。
 /// 目標：piece 數量控制在 2,000–10,000 之間。
@@ -598,17 +609,15 @@ async fn ensure_server_running(runtime: Arc<Mutex<ShareRuntime>>) -> Result<Stri
         }
     }
 
-    let listener = TcpListener::bind("0.0.0.0:0")
-        .map_err(|e| format!("Failed to bind local web server: {e}"))?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| format!("Failed to read local address: {e}"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("Failed to set listener non-blocking: {e}"))?;
+    dev_log!("[mesh-p2p][share] Starting local HTTPS server...");
 
-    let host_ip = detect_host_ip();
-    let base_url = format!("https://{}:{}", host_ip, addr.port());
+    let bind_addr = resolve_bind_addr();
+
+    let advertised_host = resolve_advertised_host();
+    dev_log!(
+        "[mesh-p2p][share] Binding on {}, advertised host {}",
+        bind_addr, advertised_host
+    );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -628,32 +637,91 @@ async fn ensure_server_running(runtime: Arc<Mutex<ShareRuntime>>) -> Result<Stri
         .route("/api/file/{file_id}", get(file_handler))
         .route("/api/health", get(health_handler))
         .with_state(http_state)
+        .layer(axum::middleware::from_fn(request_log_middleware))
         .layer(tower_http::cors::CorsLayer::permissive());
 
-    tauri::async_runtime::spawn(async move {
-        let cert = include_bytes!("../certs/cert.pem").to_vec();
-        let key = include_bytes!("../certs/key.pem").to_vec();
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert, key)
-            .await
-            .expect("Failed to load embedded TLS certificate/key");
+    let handle = axum_server::Handle::new();
+    let handle_for_wait = handle.clone();
+    let advertised_host_for_tls = advertised_host.clone();
 
-        let handle = axum_server::Handle::new();
+    tauri::async_runtime::spawn(async move {
+        let (cert, key) = match generate_runtime_tls_material(&advertised_host_for_tls) {
+            Ok((cert, key)) => {
+                dev_log!(
+                    "[mesh-p2p][share] Generated runtime TLS certificate (SAN includes localhost)"
+                );
+                (cert, key)
+            }
+            Err(err) => {
+                dev_log!(
+                    "[mesh-p2p][share] Runtime TLS cert generation failed: {err}; fallback to embedded cert"
+                );
+                (
+                    include_bytes!("../certs/cert.pem").to_vec(),
+                    include_bytes!("../certs/key.pem").to_vec(),
+                )
+            }
+        };
+
+        let base_tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert, key)
+            .await
+            .expect("Failed to load TLS certificate/key");
+
+        let mut rustls_server_config = (*base_tls_config.get_inner()).clone();
+        rustls_server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        rustls_server_config.send_tls13_tickets = 0;
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(
+            rustls_server_config,
+        ));
+
+        dev_log!("[mesh-p2p][share] TLS config loaded, starting Axum server loop...");
+
         let handle_clone = handle.clone();
         tokio::spawn(async move {
             let _ = shutdown_rx.await;
             handle_clone.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
         });
 
-        let server_result = axum_server::from_tcp_rustls(listener.try_clone().unwrap(), tls_config)
-            .unwrap()
+        let server_result = axum_server::bind_rustls(bind_addr, tls_config)
+            .http1_only()
             .handle(handle)
             .serve(router.into_make_service_with_connect_info::<SocketAddr>())
             .await;
 
         if let Err(err) = server_result {
-            eprintln!("Share server failed: {err}");
+            dev_log!("[mesh-p2p][share] Server failed: {err}");
+        } else {
+            dev_log!("[mesh-p2p][share] Server loop exited cleanly");
         }
     });
+
+    let listening_addr = tokio::time::timeout(Duration::from_secs(4), handle_for_wait.listening())
+        .await
+        .map_err(|_| "server did not report listening address in time".to_string())?
+        .ok_or_else(|| "server failed to bind listening socket".to_string())?;
+
+    let base_url = format!(
+        "https://{}:{}",
+        format_host_for_url(&advertised_host),
+        listening_addr.port()
+    );
+    dev_log!(
+        "[mesh-p2p][share] HTTPS server ready at {} (health: {}/api/health)",
+        base_url, base_url
+    );
+
+    if listening_addr.ip().is_unspecified() {
+        dev_log!(
+            "[mesh-p2p][share] Listener is on wildcard {}",
+            listening_addr
+        );
+    }
+
+    if listening_addr.port() == 0 {
+        return Err(format!(
+            "Failed to start local HTTPS server on {base_url}. Invalid port detected. Try setting MESH_P2P_HOST to a reachable LAN IP."
+        ));
+    }
 
     {
         let mut guard = runtime
@@ -689,6 +757,38 @@ fn enforce_rate_limit(state: &HttpState) -> Result<(), StatusCode> {
 
     limiter.push_back(now);
     Ok(())
+}
+
+async fn request_log_middleware(req: Request<Body>, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let remote = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let started = Instant::now();
+
+    dev_log!(
+        "[mesh-p2p][http] incoming {} {}{} from {}",
+        method, path, query, remote
+    );
+
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+    let elapsed_ms = started.elapsed().as_millis();
+
+    dev_log!(
+        "[mesh-p2p][http] {} {}{} from {} -> {} ({} ms)",
+        method, path, query, remote, status, elapsed_ms
+    );
+
+    response
 }
 
 static WEBTORRENT_JS_RAW: &[u8] =
@@ -1324,6 +1424,12 @@ async fn download_page_handler() -> impl IntoResponse {
                     }
 
                     onMounted(async () => {
+                        if (!window.isSecureContext) {
+                            browserSupported.value = false;
+                            statusText.value = '目前連線不是受信任的安全內容（憑證未受信任或主機名稱不符），瀏覽器已停用 File System Access API。請改用受信任憑證後再開啟此頁。';
+                            return;
+                        }
+
                         if (!window.showDirectoryPicker) {
                             browserSupported.value = false;
                             statusText.value = '本系統僅支援 File System Access API 之瀏覽器（如 Chrome、Edge）。';
@@ -1808,6 +1914,7 @@ async fn file_handler(
 }
 
 async fn health_handler() -> impl IntoResponse {
+    dev_log!("[mesh-p2p][http] health handler reached");
     Json(serde_json::json!({ "ok": true }))
 }
 
@@ -1889,7 +1996,7 @@ async fn client_stats_handler(
     rebuild_reported_metrics(&mut guard, now);
     guard.last_activity_unix_ms = unix_time_ms();
 
-    eprintln!(
+    dev_log!(
         "client-stats accepted client={} file={} p2p_uploaded_bytes={} active_peers={} is_seeding={}",
         report.client_id,
         report.file_id,
@@ -2546,6 +2653,82 @@ fn detect_host_ip() -> String {
         })
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+fn resolve_bind_addr() -> SocketAddr {
+    let port = std::env::var("MESH_P2P_PORT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .unwrap_or(0);
+
+    SocketAddr::from(([0, 0, 0, 0], port))
+}
+
+fn resolve_advertised_host() -> String {
+    if let Ok(raw) = std::env::var("MESH_P2P_HOST") {
+        let value = raw.trim();
+        if !value.is_empty() {
+            if is_loopback_host(value) {
+                dev_log!(
+                    "[mesh-p2p][share] Ignoring loopback MESH_P2P_HOST='{}' for LAN sharing",
+                    value
+                );
+            } else {
+                return value.to_string();
+            }
+        }
+    }
+
+    let detected = detect_host_ip();
+    if is_loopback_host(&detected) {
+        dev_log!(
+            "[mesh-p2p][share] Could not detect a LAN IP, fallback to {}",
+            detected
+        );
+    }
+    detected
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let normalized = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if normalized.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    normalized
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn generate_runtime_tls_material(advertised_host: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut names = vec!["localhost".to_string()];
+    let trimmed_host = advertised_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+
+    // rcgen SAN entries here are DNS names; IP hostnames are intentionally skipped.
+    if !trimmed_host.is_empty()
+        && !trimmed_host.eq_ignore_ascii_case("localhost")
+        && trimmed_host.parse::<std::net::IpAddr>().is_err()
+    {
+        names.push(trimmed_host.to_string());
+    }
+
+    let certified = generate_simple_self_signed(names)
+        .map_err(|e| format!("failed to generate self-signed cert: {e}"))?;
+    let cert_pem = certified.cert.pem().into_bytes();
+    let key_pem = certified.key_pair.serialize_pem().into_bytes();
+    Ok((cert_pem, key_pem))
+}
+
+fn format_host_for_url(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
 }
 
 fn generate_session_id() -> String {
