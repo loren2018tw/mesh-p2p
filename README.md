@@ -73,3 +73,17 @@ pnpm tauri build
 - Vue - Official
 - Tauri
 - rust-analyzer
+
+## Windows 分享端連線注意事項
+
+- 若 Windows 主機有多網卡（例如 VPN 或虛擬網卡），系統自動偵測的分享 IP 可能不是區網可達位址，造成客戶端連不到分享頁。
+- 可在啟動前設定環境變數 `MESH_P2P_HOST`，強制指定分享主機位址（建議填入實際區網 IPv4）。
+
+PowerShell 範例：
+
+```powershell
+$env:MESH_P2P_HOST = "192.168.0.2"
+pnpm tauri dev
+```
+
+- 設定後，分享 URL 會使用你指定的 host，例如 `https://192.168.0.2:<port>`。

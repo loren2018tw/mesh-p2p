@@ -30,6 +30,8 @@ sha1 = "0.10"
 urlencoding = "2.1"
 hex = "0.4"
 base64 = "0.22"
+rcgen = "0.13"
+tokio-rustls = "0.26"
 tower-http = { version = "0.6.8", features = ["fs", "cors"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 
