@@ -63,7 +63,7 @@ const MIN_SUPPORTED_METADATA_VERSION: u16 = 1;
 const MAX_SUPPORTED_METADATA_VERSION: u16 = METADATA_VERSION;
 const APP_VERSION_PLACEHOLDER: &str = "__APP_VERSION__";
 const MAX_CHUNK_SIZE: usize = 50 * 1024 * 1024; // 改為 50 MB (原 200 MB)
-const MAX_CONCURRENT_RANGES: usize = 100; // 最多 100 並行 range requests
+const MAX_CONCURRENT_RANGES: usize = 30; // 限制並行 range requests，促進 P2P 分擔
 
 static APP_VERSION: OnceLock<String> = OnceLock::new();
 
@@ -616,7 +616,8 @@ async fn ensure_server_running(runtime: Arc<Mutex<ShareRuntime>>) -> Result<Stri
     let advertised_host = resolve_advertised_host();
     dev_log!(
         "[mesh-p2p][share] Binding on {}, advertised host {}",
-        bind_addr, advertised_host
+        bind_addr,
+        advertised_host
     );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -670,9 +671,8 @@ async fn ensure_server_running(runtime: Arc<Mutex<ShareRuntime>>) -> Result<Stri
         let mut rustls_server_config = (*base_tls_config.get_inner()).clone();
         rustls_server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
         rustls_server_config.send_tls13_tickets = 0;
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(
-            rustls_server_config,
-        ));
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(rustls_server_config));
 
         dev_log!("[mesh-p2p][share] TLS config loaded, starting Axum server loop...");
 
@@ -707,7 +707,8 @@ async fn ensure_server_running(runtime: Arc<Mutex<ShareRuntime>>) -> Result<Stri
     );
     dev_log!(
         "[mesh-p2p][share] HTTPS server ready at {} (health: {}/api/health)",
-        base_url, base_url
+        base_url,
+        base_url
     );
 
     if listening_addr.ip().is_unspecified() {
@@ -776,7 +777,10 @@ async fn request_log_middleware(req: Request<Body>, next: Next) -> Response {
 
     dev_log!(
         "[mesh-p2p][http] incoming {} {}{} from {}",
-        method, path, query, remote
+        method,
+        path,
+        query,
+        remote
     );
 
     let response = next.run(req).await;
@@ -785,7 +789,12 @@ async fn request_log_middleware(req: Request<Body>, next: Next) -> Response {
 
     dev_log!(
         "[mesh-p2p][http] {} {}{} from {} -> {} ({} ms)",
-        method, path, query, remote, status, elapsed_ms
+        method,
+        path,
+        query,
+        remote,
+        status,
+        elapsed_ms
     );
 
     response
@@ -1285,7 +1294,7 @@ async fn download_page_handler() -> impl IntoResponse {
                         return new Blob([buffer], { type: 'application/x-bittorrent' });
                     }
 
-                    function updateStateFromTorrent(file, torrent) {
+                    function updateStateFromTorrent(file, torrent, shouldReportStats) {
                         const state = ensureDownloadState(file.fileId);
                         const currentBytes = torrent.downloaded || 0;
                         const currentTick = nowMs();
@@ -1312,7 +1321,9 @@ async fn download_page_handler() -> impl IntoResponse {
                         state.sourceMix = torrent.numPeers > 0 ? 'P2P + HTTP web seed' : 'HTTP web seed fallback';
                         state.lastTickAt = currentTick;
                         state.lastBytesReceived = currentBytes;
-                        void reportClientStats(file, torrent, state.phase === 'seeding' || torrent.progress === 1);
+                        if (shouldReportStats) {
+                            void reportClientStats(file, torrent, state.phase === 'seeding' || torrent.progress === 1);
+                        }
                     }
 
                     async function downloadFile(file) {
@@ -1353,6 +1364,7 @@ async fn download_page_handler() -> impl IntoResponse {
                                     });
                                     return chunkStore;
                                 },
+                                maxWebConns: 2, // 限制每個 torrent 的 HTTP web seed 連線數，促進 P2P 分擔
                                 destroyStoreOnDestroy: false
                             });
                             
@@ -1366,20 +1378,26 @@ async fn download_page_handler() -> impl IntoResponse {
                                 state.errorCode = String(error);
                             });
 
-                            const tickId = setInterval(() => updateStateFromTorrent(file, torrent), 1000);
+                            let statsTickCount = 0;
+                            const STATS_REPORT_EVERY_N_TICKS = 3; // 每 3 秒回報一次 stats
+                            const tickId = setInterval(() => {
+                                statsTickCount++;
+                                const shouldReport = statsTickCount % STATS_REPORT_EVERY_N_TICKS === 0;
+                                updateStateFromTorrent(file, torrent, shouldReport);
+                            }, 1000);
                             torrentSessions[file.fileId] = { file, torrent, tickId };
 
-                            torrent.on('download', () => updateStateFromTorrent(file, torrent));
-                            torrent.on('wire', () => updateStateFromTorrent(file, torrent));
+                            torrent.on('download', () => updateStateFromTorrent(file, torrent, false));
+                            torrent.on('wire', () => updateStateFromTorrent(file, torrent, false));
                             torrent.on('warning', (warning) => {
                                 const msg = String(warning);
                                 if (!msg.includes('WebSocket') && !msg.includes('tracker') && !msg.includes('wss://')) {
                                     warningText.value = msg;
                                 }
-                                updateStateFromTorrent(file, torrent);
+                                updateStateFromTorrent(file, torrent, false);
                             });
                             torrent.on('done', async () => {
-                                updateStateFromTorrent(file, torrent);
+                                updateStateFromTorrent(file, torrent, true);
 
                                 // 關閉 writable stream，將 .crswap 臨時檔 flush 為正式檔案
                                 // commit() 後 get() 仍可透過 fileHandle.getFile() 繼續 seeding
