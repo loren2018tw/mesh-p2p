@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,6 +15,7 @@ use axum::{
     extract::Path as AxumPath,
     extract::Query,
     extract::State as AxumState,
+    extract::WebSocketUpgrade,
     http::{Request, StatusCode},
     middleware::Next,
     response::{Html, IntoResponse, Response},
@@ -19,6 +23,7 @@ use axum::{
     Json, Router,
 };
 use base64::Engine as _;
+use futures::{SinkExt, StreamExt};
 use rcgen::generate_simple_self_signed;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -27,7 +32,7 @@ use tauri_plugin_dialog::DialogExt;
 use tokio::{
     fs,
     io::AsyncReadExt,
-    sync::{oneshot, Semaphore},
+    sync::{mpsc, oneshot, Semaphore},
 };
 
 macro_rules! dev_log {
@@ -64,6 +69,10 @@ const MAX_SUPPORTED_METADATA_VERSION: u16 = METADATA_VERSION;
 const APP_VERSION_PLACEHOLDER: &str = "__APP_VERSION__";
 const MAX_CHUNK_SIZE: usize = 50 * 1024 * 1024; // 改為 50 MB (原 200 MB)
 const MAX_CONCURRENT_RANGES: usize = 30; // 限制並行 range requests，促進 P2P 分擔
+const TRACKER_MAX_CONNECTIONS: usize = 200;
+const TRACKER_ANNOUNCE_INTERVAL: u64 = 120;
+const TRACKER_PEER_TIMEOUT_SECS: u64 = 300;
+const NUM_PIECE_SLICES: u64 = 16; // piece diversity 分組數
 
 static APP_VERSION: OnceLock<String> = OnceLock::new();
 
@@ -153,6 +162,55 @@ pub struct StartShareResponse {
     session: ShareSession,
 }
 
+// ─── Built-in WebSocket Tracker ───
+
+type WsSender = mpsc::UnboundedSender<axum::extract::ws::Message>;
+
+#[derive(Debug, Clone)]
+struct TrackerPeer {
+    peer_id: String,
+    sender: WsSender,
+    is_complete: bool,
+    info_hashes: HashSet<String>,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Default)]
+struct TrackerSwarm {
+    peers: HashMap<String, WsSender>, // peer_id → sender
+    complete: HashSet<String>,        // peer_ids that are seeders
+}
+
+struct TrackerState {
+    swarms: HashMap<String, TrackerSwarm>,   // info_hash → swarm
+    peer_meta: HashMap<String, TrackerPeer>, // peer_id → peer metadata
+    connection_count: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for TrackerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackerState")
+            .field("swarm_count", &self.swarms.len())
+            .field(
+                "connection_count",
+                &self.connection_count.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+impl Default for TrackerState {
+    fn default() -> Self {
+        Self {
+            swarms: HashMap::new(),
+            peer_meta: HashMap::new(),
+            connection_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+// ─── Application State ───
+
 #[derive(Clone)]
 pub struct ShareState {
     inner: Arc<Mutex<ShareRuntime>>,
@@ -176,6 +234,8 @@ struct ShareRuntime {
     last_error: Option<String>,
     processing_progress: Option<ProcessingProgress>,
     processing_cancel_requested: bool,
+    tracker: TrackerState,
+    piece_offset_counter: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -189,6 +249,7 @@ struct HttpState {
     runtime: Arc<Mutex<ShareRuntime>>,
     limiter: Arc<Mutex<VecDeque<Instant>>>,
     range_semaphore: Arc<Semaphore>, // 限制並行 range requests
+    tracker_conn_count: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -250,6 +311,8 @@ struct MetadataResponse {
     tracker_urls: Vec<String>,
     started_at_unix_ms: u128,
     fallback_http_enabled: bool,
+    piece_priority_offset: u64,
+    builtin_tracker_url: String,
 }
 
 impl ShareState {
@@ -275,6 +338,8 @@ impl ShareState {
                 last_error: None,
                 processing_progress: None,
                 processing_cancel_requested: false,
+                tracker: TrackerState::default(),
+                piece_offset_counter: AtomicU64::new(0),
             })),
         }
     }
@@ -336,13 +401,15 @@ pub async fn add_share_files(
             .as_ref()
             .ok_or_else(|| "Share session is not active".to_string())?;
 
+        let base = guard
+            .server
+            .as_ref()
+            .map(|server| server.base_url.clone())
+            .ok_or_else(|| "Share server is not running".to_string())?;
+
         (
-            guard.tracker_urls.clone(),
-            guard
-                .server
-                .as_ref()
-                .map(|server| server.base_url.clone())
-                .ok_or_else(|| "Share server is not running".to_string())?,
+            trackers_with_builtin(&base, &guard.tracker_urls),
+            base,
             session
                 .files
                 .iter()
@@ -455,7 +522,10 @@ pub async fn start_share(
             .inner
             .lock()
             .map_err(|_| "State lock poisoned".to_string())?;
-        (guard.tracker_urls.clone(), file_paths.len())
+        (
+            trackers_with_builtin(&server_url, &guard.tracker_urls),
+            file_paths.len(),
+        )
     };
 
     // Initialize progress tracking
@@ -573,6 +643,10 @@ pub async fn stop_share(state: State<'_, ShareState>) -> Result<bool, String> {
     guard.seeding_peer_count = 0;
     guard.p2p_uploaded_bytes = 0;
     guard.active_p2p_peer_count = 0;
+    // Clear tracker state: close all WS connections by dropping senders
+    guard.tracker.swarms.clear();
+    guard.tracker.peer_meta.clear();
+    guard.piece_offset_counter = AtomicU64::new(0);
     guard.session = None;
     Ok(existed)
 }
@@ -622,16 +696,25 @@ async fn ensure_server_running(runtime: Arc<Mutex<ShareRuntime>>) -> Result<Stri
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+    let tracker_conn_count = {
+        let guard = runtime
+            .lock()
+            .map_err(|_| "State lock poisoned".to_string())?;
+        guard.tracker.connection_count.clone()
+    };
+
     let http_state = HttpState {
         runtime: runtime.clone(),
         limiter: Arc::new(Mutex::new(VecDeque::new())),
         range_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RANGES)),
+        tracker_conn_count,
     };
 
     let router = Router::new()
         .route("/", get(download_page_handler))
         .route("/webtorrent.min.js", get(webtorrent_js_handler))
         .route("/mesh.png", get(mesh_png_handler))
+        .route("/announce", get(tracker_ws_handler))
         .route("/api/metadata", get(metadata_handler))
         .route("/api/client-stats", post(client_stats_handler))
         .route("/api/torrent/{file_id}", get(torrent_handler))
@@ -1372,6 +1455,19 @@ async fn download_page_handler() -> impl IntoResponse {
                             if (typeof torrent.setMaxConns === 'function') {
                                 torrent.setMaxConns(MAX_CONCURRENT_PEERS);
                             }
+
+                            // Piece diversity: prioritize a different slice per client
+                            const NUM_SLICES = 16;
+                            const piecePriorityOffset = (metadata.value && metadata.value.piecePriorityOffset) || 0;
+                            torrent.on('ready', () => {
+                                const numPieces = torrent.pieces.length;
+                                if (numPieces > NUM_SLICES) {
+                                    const sliceSize = Math.floor(numPieces / NUM_SLICES);
+                                    const startPiece = (piecePriorityOffset * sliceSize) % numPieces;
+                                    const endPiece = Math.min(startPiece + sliceSize - 1, numPieces - 1);
+                                    torrent.select(startPiece, endPiece, 5);
+                                }
+                            });
                             
                             torrent.on('error', (error) => {
                                 destroySession(file.fileId, 'error');
@@ -1673,14 +1769,25 @@ async fn metadata_handler(
     record_client_activity(&mut guard, addr);
 
     match &guard.session {
-        Some(session) => (
-            StatusCode::OK,
-            Json(build_metadata_response(
-                session,
-                guard.fallback_http_enabled,
-            )),
-        )
-            .into_response(),
+        Some(session) => {
+            let offset =
+                guard.piece_offset_counter.fetch_add(1, Ordering::Relaxed) % NUM_PIECE_SLICES;
+            let tracker_url = guard
+                .server
+                .as_ref()
+                .map(|s| builtin_tracker_url(&s.base_url))
+                .unwrap_or_default();
+            (
+                StatusCode::OK,
+                Json(build_metadata_response(
+                    session,
+                    guard.fallback_http_enabled,
+                    offset,
+                    tracker_url,
+                )),
+            )
+                .into_response()
+        }
         None => (
             StatusCode::GONE,
             Json(ErrorResponse {
@@ -1881,6 +1988,23 @@ async fn file_handler(
         }
     };
 
+    // HTTP throttle: slow down web seed when P2P seeders are active
+    {
+        let seeding_peers = state
+            .runtime
+            .lock()
+            .map(|g| {
+                let reported = g.seeding_peer_count as usize;
+                let tracker_seeders = tracker_total_seeders(&g.tracker);
+                reported + tracker_seeders
+            })
+            .unwrap_or(0);
+        let delay = compute_http_throttle_delay(seeding_peers);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     use std::io::SeekFrom;
     use tokio::io::AsyncSeekExt;
     if file.seek(SeekFrom::Start(start)).await.is_err() {
@@ -1934,6 +2058,287 @@ async fn file_handler(
 async fn health_handler() -> impl IntoResponse {
     dev_log!("[mesh-p2p][http] health handler reached");
     Json(serde_json::json!({ "ok": true }))
+}
+
+// ─── Built-in WebSocket Tracker Handler ───
+
+async fn tracker_ws_handler(
+    ws: WebSocketUpgrade,
+    AxumState(state): AxumState<HttpState>,
+) -> impl IntoResponse {
+    let current = state.tracker_conn_count.load(Ordering::Relaxed);
+    if current >= TRACKER_MAX_CONNECTIONS as u64 {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    ws.on_upgrade(move |socket| tracker_ws_connection(socket, state))
+        .into_response()
+}
+
+async fn tracker_ws_connection(socket: axum::extract::ws::WebSocket, state: HttpState) {
+    use axum::extract::ws::Message;
+
+    let conn_count = state.tracker_conn_count.clone();
+    conn_count.fetch_add(1, Ordering::Relaxed);
+
+    let (mut ws_sink, mut ws_stream) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
+    // Spawn outbound message forwarder
+    let send_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if ws_sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut peer_id: Option<String> = None;
+
+    // Process inbound messages
+    while let Some(Ok(msg)) = ws_stream.next().await {
+        match msg {
+            Message::Text(text) => {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+                    tracker_handle_message(&parsed, &tx, &mut peer_id, &state).await;
+                }
+            }
+            Message::Binary(data) => {
+                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    tracker_handle_message(&parsed, &tx, &mut peer_id, &state).await;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // Cleanup: remove peer from all swarms
+    if let Some(pid) = &peer_id {
+        if let Ok(mut guard) = state.runtime.lock() {
+            tracker_remove_peer(&mut guard.tracker, pid);
+        }
+    }
+
+    conn_count.fetch_sub(1, Ordering::Relaxed);
+    send_task.abort();
+}
+
+async fn tracker_handle_message(
+    msg: &serde_json::Value,
+    sender: &WsSender,
+    peer_id_slot: &mut Option<String>,
+    state: &HttpState,
+) {
+    let action = msg.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+    match action {
+        "announce" => {
+            let info_hash = match msg.get("info_hash").and_then(|v| v.as_str()) {
+                Some(h) => h.to_string(),
+                None => return,
+            };
+            let peer_id = match msg.get("peer_id").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return,
+            };
+
+            *peer_id_slot = Some(peer_id.clone());
+
+            let event = msg.get("event").and_then(|v| v.as_str()).unwrap_or("");
+            let is_complete = event == "completed";
+
+            // Check if this is an answer message (relay to target peer)
+            if let Some(answer) = msg.get("answer") {
+                let to_peer_id = msg.get("to_peer_id").and_then(|v| v.as_str()).unwrap_or("");
+                let offer_id = msg.get("offer_id").cloned();
+
+                if !to_peer_id.is_empty() {
+                    let target_sender = {
+                        let guard = match state.runtime.lock() {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        };
+                        guard
+                            .tracker
+                            .swarms
+                            .get(&info_hash)
+                            .and_then(|swarm| swarm.peers.get(to_peer_id))
+                            .cloned()
+                    };
+
+                    if let Some(target_tx) = target_sender {
+                        let mut relay = serde_json::json!({
+                            "action": "announce",
+                            "info_hash": info_hash,
+                            "peer_id": peer_id,
+                            "answer": answer,
+                        });
+                        if let Some(oid) = offer_id {
+                            relay["offer_id"] = oid;
+                        }
+                        let _ = target_tx
+                            .send(axum::extract::ws::Message::Text(relay.to_string().into()));
+                    }
+                }
+                return;
+            }
+
+            // Normal announce: register peer and distribute offers
+            let (complete_count, incomplete_count, offers_to_relay) = {
+                let mut guard = match state.runtime.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                let tracker = &mut guard.tracker;
+
+                // Register peer in swarm
+                let swarm = tracker.swarms.entry(info_hash.clone()).or_default();
+                swarm.peers.insert(peer_id.clone(), sender.clone());
+                if is_complete || event == "completed" {
+                    swarm.complete.insert(peer_id.clone());
+                }
+                if event == "stopped" {
+                    swarm.peers.remove(&peer_id);
+                    swarm.complete.remove(&peer_id);
+                }
+
+                // Track peer metadata
+                let meta =
+                    tracker
+                        .peer_meta
+                        .entry(peer_id.clone())
+                        .or_insert_with(|| TrackerPeer {
+                            peer_id: peer_id.clone(),
+                            sender: sender.clone(),
+                            is_complete,
+                            info_hashes: HashSet::new(),
+                            last_seen: Instant::now(),
+                        });
+                meta.info_hashes.insert(info_hash.clone());
+                meta.last_seen = Instant::now();
+                meta.sender = sender.clone();
+                if is_complete {
+                    meta.is_complete = true;
+                }
+
+                let complete_count = swarm.complete.len();
+                let incomplete_count = swarm.peers.len().saturating_sub(complete_count);
+
+                // Collect offers to relay to other peers
+                let mut offers_to_relay: Vec<(WsSender, serde_json::Value)> = Vec::new();
+                if let Some(offers) = msg.get("offers").and_then(|v| v.as_array()) {
+                    // Get list of other peers in this swarm
+                    let other_peers: Vec<(String, WsSender)> = swarm
+                        .peers
+                        .iter()
+                        .filter(|(pid, _)| **pid != peer_id)
+                        .map(|(pid, tx)| (pid.clone(), tx.clone()))
+                        .collect();
+
+                    if !other_peers.is_empty() {
+                        for (i, offer) in offers.iter().enumerate() {
+                            let target = &other_peers[i % other_peers.len()];
+                            let relay_msg = serde_json::json!({
+                                "action": "announce",
+                                "info_hash": info_hash,
+                                "peer_id": peer_id,
+                                "offer": offer.get("offer"),
+                                "offer_id": offer.get("offer_id"),
+                            });
+                            offers_to_relay.push((target.1.clone(), relay_msg));
+                        }
+                    }
+                }
+
+                (complete_count, incomplete_count, offers_to_relay)
+            };
+
+            // Send offers outside of lock
+            for (target_tx, relay_msg) in offers_to_relay {
+                let _ = target_tx.send(axum::extract::ws::Message::Text(
+                    relay_msg.to_string().into(),
+                ));
+            }
+
+            // Send announce response to the announcing peer
+            let response = serde_json::json!({
+                "action": "announce",
+                "info_hash": info_hash,
+                "complete": complete_count,
+                "incomplete": incomplete_count,
+                "interval": TRACKER_ANNOUNCE_INTERVAL,
+            });
+            let _ = sender.send(axum::extract::ws::Message::Text(
+                response.to_string().into(),
+            ));
+        }
+        "scrape" => {
+            // Minimal scrape support
+            if let Some(hashes) = msg.get("info_hash") {
+                let guard = match state.runtime.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                let mut files = serde_json::Map::new();
+                let hash_list: Vec<&str> = if let Some(arr) = hashes.as_array() {
+                    arr.iter().filter_map(|v| v.as_str()).collect()
+                } else if let Some(s) = hashes.as_str() {
+                    vec![s]
+                } else {
+                    return;
+                };
+                for h in hash_list {
+                    let (c, i) = guard
+                        .tracker
+                        .swarms
+                        .get(h)
+                        .map(|s| {
+                            let c = s.complete.len();
+                            (c, s.peers.len().saturating_sub(c))
+                        })
+                        .unwrap_or((0, 0));
+                    files.insert(
+                        h.to_string(),
+                        serde_json::json!({ "complete": c, "incomplete": i }),
+                    );
+                }
+                let resp = serde_json::json!({
+                    "action": "scrape",
+                    "files": files,
+                });
+                let _ = sender.send(axum::extract::ws::Message::Text(resp.to_string().into()));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tracker_remove_peer(tracker: &mut TrackerState, peer_id: &str) {
+    if let Some(meta) = tracker.peer_meta.remove(peer_id) {
+        for ih in &meta.info_hashes {
+            if let Some(swarm) = tracker.swarms.get_mut(ih) {
+                swarm.peers.remove(peer_id);
+                swarm.complete.remove(peer_id);
+                // Remove empty swarms
+                if swarm.peers.is_empty() {
+                    tracker.swarms.remove(ih);
+                }
+            }
+        }
+    }
+}
+
+fn tracker_total_seeders(tracker: &TrackerState) -> usize {
+    tracker.swarms.values().map(|s| s.complete.len()).sum()
+}
+
+fn compute_http_throttle_delay(seeding_peers: usize) -> Duration {
+    match seeding_peers {
+        0 => Duration::ZERO,
+        1..=3 => Duration::from_millis(50),
+        4..=7 => Duration::from_millis(150),
+        _ => Duration::from_millis(300),
+    }
 }
 
 async fn client_stats_handler(
@@ -2206,6 +2611,8 @@ fn refresh_session_summary(session: &mut ShareSession, revision: u64, last_updat
 fn build_metadata_response(
     session: &ShareSession,
     fallback_http_enabled: bool,
+    piece_priority_offset: u64,
+    builtin_tracker_url: String,
 ) -> MetadataResponse {
     MetadataResponse {
         metadata_version: METADATA_VERSION,
@@ -2220,6 +2627,8 @@ fn build_metadata_response(
         tracker_urls: session.tracker_urls.clone(),
         started_at_unix_ms: session.started_at_unix_ms,
         fallback_http_enabled,
+        piece_priority_offset,
+        builtin_tracker_url,
     }
 }
 
@@ -2611,6 +3020,22 @@ fn parse_trackers(raw: &str) -> Vec<String> {
         })
         .map(ToString::to_string)
         .collect()
+}
+
+/// Build tracker URL list with builtin tracker prepended.
+/// Converts base_url like `https://host:port` to `wss://host:port/announce`.
+fn trackers_with_builtin(base_url: &str, external_trackers: &[String]) -> Vec<String> {
+    let builtin = builtin_tracker_url(base_url);
+    let mut all = vec![builtin];
+    all.extend(external_trackers.iter().cloned());
+    all
+}
+
+fn builtin_tracker_url(base_url: &str) -> String {
+    let ws_base = base_url
+        .replace("https://", "wss://")
+        .replace("http://", "ws://");
+    format!("{ws_base}/announce")
 }
 
 fn build_magnet_uri(
