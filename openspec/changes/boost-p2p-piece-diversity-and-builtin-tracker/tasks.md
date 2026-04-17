@@ -27,15 +27,17 @@
 - [x] 4.2 修改 `downloadFile()` 函式：在 torrent ready 後，根據 `piecePriorityOffset` 將 pieces 分為高低優先級群組，使用 `torrent.select(start, end, priority)` 設定優先順序
 - [x] 4.3 確保所有 pieces 最終都會被下載（低優先級群組 priority > 0）
 
-## 5. HTTP Web Seed 動態限速
+## 5. HTTP Web Seed「Seeder 培養」名額制（取代原均勻限速）
 
-- [x] 5.1 新增函式 `compute_http_throttle_delay()`：根據 `ShareRuntime` 中的 seeding_peer_count 計算每個 chunk 的延遲時間（0 seeder → 0ms, 1-3 → 50ms, 4-7 → 150ms, ≥8 → 300ms）
-- [x] 5.2 修改 `file_handler`（HTTP range request handler）：在每個 chunk 寫入 response body 後，呼叫 `tokio::time::sleep` 插入對應延遲
-- [x] 5.3 確認 seeding_peer_count 統計包含 tracker 內的 complete peers 數量（結合 client-stats 與 tracker swarm 資料）
+- [x] 5.1 在 `ShareRuntime` 新增 fast slot 資料結構：`fast_slots: HashMap<IpAddr, Instant>`（IP → 最後活動時間）、常數 `FAST_SLOT_COUNT: usize = 2`、`FAST_SLOT_TIMEOUT_SECS: u64 = 60`、`NON_SLOT_DELAY_MS: u64 = 2000`
+- [x] 5.2 新增函式 `acquire_fast_slot(slots, ip, now) -> bool`：若 IP 已在 slots 中則更新時間並回傳 true；若 slots 未滿則加入並回傳 true；否則回傳 false。同時清除超時的 slot entries
+- [x] 5.3 修改 `file_handler`（HTTP range request handler）：取得 semaphore permit 後，呼叫 `acquire_fast_slot` 判斷是否為 fast slot client — 是則不延遲，否則 `tokio::time::sleep(2000ms)`
+- [x] 5.4 修改 `client_stats_handler`：當收到 `is_seeding: true` 且該 client IP 在 fast_slots 中時，從 fast_slots 移除該 IP（釋放名額）
+- [x] 5.5 移除舊的 `compute_http_throttle_delay()` 函式及其呼叫點
 
 ## 6. 驗證與測試
 
-- [ ] 6.1 手動測試：啟動分享，用兩個瀏覽器同時下載，確認兩者透過內建 tracker 互相發現並建立 P2P 連線
+- [x] 6.1 手動測試：啟動分享，用兩個瀏覽器同時下載，確認兩者透過內建 tracker 互相發現並建立 P2P 連線
 - [x] 6.2 驗證 piece diversity：觀察兩個 client 的下載順序確實不同，P2P uploaded bytes 開始成長
-- [x] 6.3 驗證 HTTP 限速生效：當有 seeder 時，HTTP fallback 次數增長速度明顯降低
+- [ ] 6.3 驗證 Seeder 培養生效：前 2 位 client 全速下載，第 3 位 client 的 HTTP 被大幅延遲但可從已完成的 seeder 透過 P2P 下載
 - [ ] 6.4 驗證 fallback：斷開內建 tracker 連線後，client 仍可透過外部 tracker 或 HTTP web seed 完成下載

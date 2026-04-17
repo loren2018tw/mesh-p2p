@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::{SocketAddr, UdpSocket},
+    net::{IpAddr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -73,6 +73,9 @@ const TRACKER_MAX_CONNECTIONS: usize = 200;
 const TRACKER_ANNOUNCE_INTERVAL: u64 = 120;
 const TRACKER_PEER_TIMEOUT_SECS: u64 = 300;
 const NUM_PIECE_SLICES: u64 = 16; // piece diversity 分組數
+const FAST_SLOT_COUNT: usize = 2; // 全速 HTTP 下載名額數
+const FAST_SLOT_TIMEOUT_SECS: u64 = 60; // fast slot 無活動超時秒數
+const NON_SLOT_DELAY_MS: u64 = 2000; // non-slot client 每 chunk 延遲 ms
 
 static APP_VERSION: OnceLock<String> = OnceLock::new();
 
@@ -236,6 +239,7 @@ struct ShareRuntime {
     processing_cancel_requested: bool,
     tracker: TrackerState,
     piece_offset_counter: AtomicU64,
+    fast_slots: HashMap<IpAddr, Instant>,
 }
 
 #[derive(Debug)]
@@ -340,6 +344,7 @@ impl ShareState {
                 processing_cancel_requested: false,
                 tracker: TrackerState::default(),
                 piece_offset_counter: AtomicU64::new(0),
+                fast_slots: HashMap::new(),
             })),
         }
     }
@@ -647,6 +652,7 @@ pub async fn stop_share(state: State<'_, ShareState>) -> Result<bool, String> {
     guard.tracker.swarms.clear();
     guard.tracker.peer_meta.clear();
     guard.piece_offset_counter = AtomicU64::new(0);
+    guard.fast_slots.clear();
     guard.session = None;
     Ok(existed)
 }
@@ -1990,18 +1996,13 @@ async fn file_handler(
 
     // HTTP throttle: slow down web seed when P2P seeders are active
     {
-        let seeding_peers = state
+        let has_slot = state
             .runtime
             .lock()
-            .map(|g| {
-                let reported = g.seeding_peer_count as usize;
-                let tracker_seeders = tracker_total_seeders(&g.tracker);
-                reported + tracker_seeders
-            })
-            .unwrap_or(0);
-        let delay = compute_http_throttle_delay(seeding_peers);
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
+            .map(|mut g| acquire_fast_slot(&mut g.fast_slots, addr.ip(), Instant::now()))
+            .unwrap_or(false);
+        if !has_slot {
+            tokio::time::sleep(Duration::from_millis(NON_SLOT_DELAY_MS)).await;
         }
     }
 
@@ -2332,13 +2333,27 @@ fn tracker_total_seeders(tracker: &TrackerState) -> usize {
     tracker.swarms.values().map(|s| s.complete.len()).sum()
 }
 
-fn compute_http_throttle_delay(seeding_peers: usize) -> Duration {
-    match seeding_peers {
-        0 => Duration::ZERO,
-        1..=3 => Duration::from_millis(50),
-        4..=7 => Duration::from_millis(150),
-        _ => Duration::from_millis(300),
+/// Try to acquire a fast slot for `ip`. Returns true if the IP holds a slot (full speed).
+/// Also evicts timed-out entries.
+fn acquire_fast_slot(slots: &mut HashMap<IpAddr, Instant>, ip: IpAddr, now: Instant) -> bool {
+    let timeout = Duration::from_secs(FAST_SLOT_TIMEOUT_SECS);
+    // Evict expired slots
+    slots.retain(|_, last_active| now.duration_since(*last_active) < timeout);
+    // Already holds a slot → refresh
+    if let Some(entry) = slots.get_mut(&ip) {
+        *entry = now;
+        return true;
     }
+    // Slot available → grant
+    if slots.len() < FAST_SLOT_COUNT {
+        slots.insert(ip, now);
+        return true;
+    }
+    false
+}
+
+fn release_fast_slot(slots: &mut HashMap<IpAddr, Instant>, ip: &IpAddr) {
+    slots.remove(ip);
 }
 
 async fn client_stats_handler(
@@ -2418,6 +2433,11 @@ async fn client_stats_handler(
     );
     rebuild_reported_metrics(&mut guard, now);
     guard.last_activity_unix_ms = unix_time_ms();
+
+    // Release fast slot when client becomes a seeder
+    if report.is_seeding {
+        release_fast_slot(&mut guard.fast_slots, &addr.ip());
+    }
 
     dev_log!(
         "client-stats accepted client={} file={} p2p_uploaded_bytes={} active_peers={} is_seeding={}",

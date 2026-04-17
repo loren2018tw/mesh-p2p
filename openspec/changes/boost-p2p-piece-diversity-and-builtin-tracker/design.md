@@ -73,20 +73,37 @@
 - Client 端在 torrent ready 後，將 pieces 分為 `numSlices` 組（依據 client 總數），優先下載 offset 對應的那組
 - 使用 `torrent.select(start, end, priority)` 設定片段優先級
 
-### Decision 3: HTTP web seed 動態限速
+### Decision 3: HTTP web seed「Seeder 培養」策略（取代均勻限速）
 
-**選擇**：根據當前 swarm 中 seeding peer 數量，在 HTTP range response 中插入 delay，降低 HTTP 輸出速率。
+**選擇**：Server 維護固定數量的「全速下載名額」（fast slots，預設 2 個）。擁有名額的 client 以全速 HTTP 下載，其餘 client 的 HTTP 請求被大幅延遲（僅靠 P2P 取得資料）。當全速 client 完成下載成為 seeder 後，名額釋放給下一位等待的 client。
 
-**策略**：
+**被取代的方案**：
+
+- **依 seeder 數量均勻限速（原 Decision 3）**：實測發現效果差。所有 client 都被限速 → 都慢慢下載 → 都只有部分 pieces → 上傳能力弱 → P2P 流量仍低。根本問題是「下載中的 client 上傳能力遠低於已完成的 seeder」。
+
+**策略邏輯**：
 
 ```
-seeding_peers == 0 → 不限速（全速 HTTP）
-seeding_peers 1-3  → 每 chunk 延遲 50ms（約限速 50%）
-seeding_peers 4-7  → 每 chunk 延遲 150ms（約限速 75%）
-seeding_peers >= 8 → 每 chunk 延遲 300ms（HTTP 僅補漏）
+fast_slots = 2  （可全速 HTTP 下載的名額數）
+
+file_handler 收到 range request:
+  if client IP 在 fast_slots 中 → 全速回應（0ms delay）
+  elif fast_slots 未滿           → 加入 fast_slots，全速回應
+  else                           → 大幅延遲（2000ms/chunk），迫使依賴 P2P
+
+client_stats_handler 收到 is_seeding=true:
+  if client IP 在 fast_slots 中 → 從 fast_slots 移除（名額釋放）
+
+超時保護:
+  if fast_slot client 超過 60 秒無 range request → 移除（防止 slot 被占死）
 ```
 
-**理由**：直接在 HTTP 回應層控制速率最簡單，不需要修改 WebTorrent 的排程邏輯。讓 HTTP 變慢後，WebTorrent 自然會更多地從 P2P peers 取得資料。
+**理由**：
+
+1. **完整 seeder 的上傳效率遠高於下載中 client**：seeder 擁有全部 pieces、無需保留頻寬給自己的下載、能滿足所有 peer 的任何請求
+2. **Seeder 數量指數成長**：每一輪培養出的 seeder 都能加速下一輪，1→2→4→8→16
+3. **Server 頻寬利用率最大化**：永遠在全速培養下一個完整 seeder，不浪費頻寬在「半成品」
+4. **Non-slot client 不會卡死**：仍可從已完成的 seeder 透過 P2P 全速下載，且如果 P2P 不可用，HTTP 仍有（很慢的）fallback
 
 ### Decision 4: 內建 tracker 為首選，外部 tracker 作為 fallback
 
@@ -98,5 +115,6 @@ seeding_peers >= 8 → 每 chunk 延遲 300ms（HTTP 僅補漏）
 
 - **WebSocket 連線數壓力** → 每個下載端都會建立 WebSocket 長連線到 tracker，如果同時 100+ 下載端可能有記憶體壓力。Mitigation：設定連線數上限，超過時拒絕新連線並回退到外部 tracker。
 - **Piece priority 與 WebTorrent 內部排程衝突** → WebTorrent 有自己的 rarest-first 策略，外部設定 priority 可能被覆蓋。Mitigation：使用 `torrent.select()` API 是 WebTorrent 官方支援的介面，會被 piece picker 尊重。
-- **HTTP 限速可能降低首個 client 的體驗** → 當只有 1 個 seeder 時就開始限速，但此時只有 2 人在下載。Mitigation：seeder 數為 0 時完全不限速，確保首個下載者體驗不變。
+- **Non-slot client 初期體驗** → 未獲得 fast slot 的 client 初期可能幾乎無進度（P2P seeder 尚未就緒）。Mitigation：fast slots 為 2 個，第一批 seeder 培養完成後即可 P2P 服務後續 client；且 HTTP 仍有極慢 fallback（2s/chunk）不至於完全卡死。
+- **Fast slot 被慢速 client 佔用** → 如果一個 slot client 網路極慢，會拖累整體效率。Mitigation：60 秒無活動超時自動釋放 slot。
 - **Tracker state 在伺服器記憶體中** → 重啟會丟失所有 peer 連線。Mitigation：WebTorrent 客戶端有自動重連機制，重啟後 peers 會自動重新 announce。

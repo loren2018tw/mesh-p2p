@@ -21,24 +21,34 @@
 
 ## ADDED Requirements
 
-### Requirement: HTTP web seed 根據 swarm seeder 數量動態限速
+### Requirement: HTTP web seed 採用「Seeder 培養」名額制（取代均勻限速）
 
-系統 MUST 根據當前 swarm 中 seeding peer 數量，動態調整 HTTP file serving 的回應速率。seeding peers 越多，HTTP 回應速率越低，讓 P2P 有更多機會分擔流量。
+系統 MUST 維護固定數量的「全速下載名額」（fast slots，預設 2 個），只有持有名額的 client 可全速透過 HTTP 下載。未持有名額的 client 的 HTTP range request MUST 被大幅延遲（每 chunk ≥ 2000ms），迫使其依賴 P2P 取得資料。當持有名額的 client 完成下載（回報 is_seeding=true）後，名額 MUST 自動釋放給下一位 client。
 
-#### Scenario: 無 seeding peer 時 HTTP 全速
+#### Scenario: 前 N 位 client 自動獲得 fast slot
 
-- **WHEN** 目前 swarm 中無任何 seeding peer（所有 client 皆在下載中或尚未有 client）
-- **THEN** HTTP file serving 不做任何限速，以最大速率回應 range request
+- **WHEN** 前兩位 client 開始發送 HTTP range request 下載檔案
+- **THEN** 這兩位 client 自動獲得 fast slot，HTTP 回應無延遲，以全速下載
 
-#### Scenario: 少量 seeding peers 時 HTTP 適度限速
+#### Scenario: fast slot 已滿時新 client 被大幅延遲
 
-- **WHEN** swarm 中有 1 至 3 個 seeding peers
-- **THEN** HTTP file serving 對每個 chunk 回應加入適度延遲（約 50ms/chunk），降低 HTTP 輸出速率約 50%
+- **WHEN** 兩個 fast slot 已被占用，第三位 client 發送 HTTP range request
+- **THEN** 該 client 的每個 chunk 回應被延遲至少 2000ms，迫使 WebTorrent 排程器優先使用 P2P 來源
 
-#### Scenario: 充足 seeding peers 時 HTTP 大幅限速
+#### Scenario: fast slot client 完成下載後名額釋放
 
-- **WHEN** swarm 中有 8 個以上 seeding peers
-- **THEN** HTTP file serving 對每個 chunk 回應加入顯著延遲（約 300ms/chunk），HTTP 僅作為補漏角色
+- **WHEN** 持有 fast slot 的 client 透過 client-stats API 回報 `isSeeding: true`
+- **THEN** 該 client 的 fast slot 立即釋放，下一位發送 range request 的 non-slot client 自動獲得名額
+
+#### Scenario: fast slot 超時保護
+
+- **WHEN** 持有 fast slot 的 client 超過 60 秒未發送任何 range request
+- **THEN** 該 slot 自動釋放，防止 slot 被無活動 client 永久占用
+
+#### Scenario: non-slot client 仍有 HTTP fallback
+
+- **WHEN** 未持有 fast slot 的 client 無法從 P2P peer 取得資料
+- **THEN** 該 client 仍可透過延遲後的 HTTP range request 取得資料（極慢但不會完全中斷）
 
 ### Requirement: 內建 tracker WebSocket endpoint 可用
 
