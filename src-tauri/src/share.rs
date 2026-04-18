@@ -1453,7 +1453,7 @@ async fn download_page_handler() -> impl IntoResponse {
                                     });
                                     return chunkStore;
                                 },
-                                maxWebConns: 2, // 限制每個 torrent 的 HTTP web seed 連線數，促進 P2P 分擔
+                                maxWebConns: 1, // 僅 1 條 HTTP web seed 連線，讓 P2P 有更多機會分擔
                                 destroyStoreOnDestroy: false
                             });
                             
@@ -1462,16 +1462,25 @@ async fn download_page_handler() -> impl IntoResponse {
                                 torrent.setMaxConns(MAX_CONCURRENT_PEERS);
                             }
 
-                            // Piece diversity: prioritize a different slice per client
+                            // Piece diversity: rotate ENTIRE download order per client
+                            // Each client gets a different starting slice and downloads all slices
+                            // in a rotated sequence with decreasing priorities.
                             const NUM_SLICES = 16;
                             const piecePriorityOffset = (metadata.value && metadata.value.piecePriorityOffset) || 0;
                             torrent.on('ready', () => {
                                 const numPieces = torrent.pieces.length;
                                 if (numPieces > NUM_SLICES) {
                                     const sliceSize = Math.floor(numPieces / NUM_SLICES);
-                                    const startPiece = (piecePriorityOffset * sliceSize) % numPieces;
-                                    const endPiece = Math.min(startPiece + sliceSize - 1, numPieces - 1);
-                                    torrent.select(startPiece, endPiece, 5);
+                                    // Remove default selection so we can re-order entirely
+                                    torrent.deselect(0, numPieces - 1, 0);
+                                    // Re-select all slices in rotated order with decreasing priority
+                                    for (let i = 0; i < NUM_SLICES; i++) {
+                                        const sliceIdx = (piecePriorityOffset + i) % NUM_SLICES;
+                                        const start = sliceIdx * sliceSize;
+                                        const end = (sliceIdx === NUM_SLICES - 1) ? numPieces - 1 : (sliceIdx + 1) * sliceSize - 1;
+                                        const priority = NUM_SLICES - i; // 16, 15, 14, ... 1
+                                        torrent.select(start, end, priority);
+                                    }
                                 }
                             });
                             
